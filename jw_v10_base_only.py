@@ -31,13 +31,12 @@ P_GRID = [1.0, 2.0, 3.0, 4.0]  # w = 1/mae^p
 # (B) LGB 파라미터 미니 그리드
 RUN_LGB_GRID = True
 LGB_GRID = [
-    # learning_rate, num_leaves, min_child_samples, reg_lambda
-    dict(learning_rate=0.03, num_leaves=511,  min_child_samples=20, reg_lambda=1.0),
-    dict(learning_rate=0.02, num_leaves=511,  min_child_samples=20, reg_lambda=2.0),
-    dict(learning_rate=0.02, num_leaves=1023, min_child_samples=20, reg_lambda=2.0),
-    dict(learning_rate=0.02, num_leaves=1023, min_child_samples=40, reg_lambda=3.0),
-    dict(learning_rate=0.015, num_leaves=2047, min_child_samples=40, reg_lambda=3.0),
-    dict(learning_rate=0.01, num_leaves=2047, min_child_samples=60, reg_lambda=5.0),
+    dict(learning_rate=0.02, num_leaves=1023, min_child_samples=20, reg_lambda=2.0, colsample_bytree=0.6),
+    dict(learning_rate=0.02, num_leaves=1023, min_child_samples=40, reg_lambda=3.0, colsample_bytree=0.5),
+    dict(learning_rate=0.015, num_leaves=2047, min_child_samples=40, reg_lambda=3.0, colsample_bytree=0.6),
+    dict(learning_rate=0.01, num_leaves=2047, min_child_samples=60, reg_lambda=5.0, colsample_bytree=0.5),
+    dict(learning_rate=0.015, num_leaves=1023, min_child_samples=30, reg_lambda=2.0, colsample_bytree=0.5, subsample=0.75, feature_fraction_bynode=0.5),
+    dict(learning_rate=0.01, num_leaves=1535, min_child_samples=50, reg_lambda=4.0, colsample_bytree=0.5, subsample=0.7, feature_fraction_bynode=0.4),
 ]
 
 # (3) 앙상블 가중치 강화: w = 1/mae^p
@@ -158,6 +157,8 @@ TS_COLS = [
     'pack_utilization', 'congestion_score', 'avg_trip_distance',
     'low_battery_ratio', 'outbound_truck_wait_min',
     'order_per_station', 'robot_efficiency', 'order_pressure',
+    'max_zone_density', 'sku_concentration',
+    'battery_risk', 'battery_cv', 'risk_index', 'bottle_neck',
 ]
 
 
@@ -167,22 +168,21 @@ def add_timeseries_features(df):
         if col not in df.columns:
             continue
         g = df.groupby('scenario_id')[col]
-        for lag in (1, 2, 3):
+        for lag in (1, 2, 3, 4, 5):
             df[f'{col}_lag{lag}'] = g.shift(lag)
         df[f'{col}_diff1'] = g.shift(1) - g.shift(2)
-        df[f'{col}_roll3_mean'] = g.transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
-        df[f'{col}_roll5_mean'] = g.transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
-        df[f'{col}_roll3_std']  = g.transform(lambda x: x.shift(1).rolling(3, min_periods=1).std().fillna(0))
-        # 과거 누적/지수이동(미래 누수 방지: shift(1) 후 누적)
+        df[f'{col}_diff2'] = g.shift(2) - g.shift(3)
+        for w in (3, 5, 10):
+            df[f'{col}_roll{w}_mean'] = g.transform(lambda x, w=w: x.shift(1).rolling(w, min_periods=1).mean())
+            df[f'{col}_roll{w}_std']  = g.transform(lambda x, w=w: x.shift(1).rolling(w, min_periods=1).std().fillna(0))
+            df[f'{col}_roll{w}_max']  = g.transform(lambda x, w=w: x.shift(1).rolling(w, min_periods=1).max())
+            df[f'{col}_roll{w}_min']  = g.transform(lambda x, w=w: x.shift(1).rolling(w, min_periods=1).min())
         df[f'{col}_exp_mean'] = g.transform(lambda x: x.shift(1).expanding(min_periods=1).mean())
-        df[f'{col}_exp_std']  = g.transform(lambda x: x.shift(1).expanding(min_periods=2).std()).fillna(0)
         df[f'{col}_ewm_mean'] = g.transform(lambda x: x.shift(1).ewm(alpha=0.3, adjust=False).mean())
 
     lag_cols = [c for c in df.columns if ('_lag' in c or '_diff' in c) and c not in ID_COLS]
     if lag_cols:
-        # NOTE: bfill은 미래 시점의 값을 끌어오므로 사용하지 않음.
         df[lag_cols] = df.groupby('scenario_id')[lag_cols].ffill()
-        # 초기 슬롯(shift로 생긴 NaN)만 안전하게 채우기: 해당 피처의 시나리오 평균 -> 전체 중앙값
         for c in lag_cols:
             base_col = c.split('_lag')[0].split('_diff')[0]
             if base_col in df.columns:
@@ -192,11 +192,61 @@ def add_timeseries_features(df):
     return df
 
 
+def add_interaction_features(df):
+    """피처 간 상호작용 (타겟 lag 없이 성능을 더 끌어올리는 핵심)"""
+    if 'congestion_score' in df.columns and 'pack_utilization' in df.columns:
+        df['cong_x_pack'] = df['congestion_score'] * df['pack_utilization']
+    if 'congestion_score' in df.columns and 'avg_trip_distance' in df.columns:
+        df['cong_x_trip'] = df['congestion_score'] * df['avg_trip_distance']
+    if 'low_battery_ratio' in df.columns and 'robot_efficiency' in df.columns:
+        df['lowbat_x_eff'] = df['low_battery_ratio'] * (1 - df['robot_efficiency'])
+    if 'order_per_station' in df.columns and 'congestion_score' in df.columns:
+        df['ops_x_cong'] = df['order_per_station'] * df['congestion_score']
+    if 'order_per_station' in df.columns and 'pack_utilization' in df.columns:
+        df['ops_x_pack'] = df['order_per_station'] * df['pack_utilization']
+    if 'timeslot' in df.columns:
+        for col in ['congestion_score', 'pack_utilization', 'order_per_station', 'low_battery_ratio']:
+            if col in df.columns:
+                df[f'ts_x_{col}'] = df['timeslot'] * df[col]
+
+    scen_agg_cols = [
+        'congestion_score', 'order_inflow_15m', 'battery_mean', 'pack_utilization',
+        'avg_trip_distance', 'low_battery_ratio', 'max_zone_density', 'sku_concentration',
+        'robot_idle', 'outbound_truck_wait_min', 'order_per_station', 'robot_efficiency',
+        'order_pressure', 'risk_index', 'battery_risk', 'battery_cv',
+    ]
+    for col in scen_agg_cols:
+        if col not in df.columns:
+            continue
+        stats = df.groupby('scenario_id')[col].agg(['mean', 'max', 'min', 'std']).reset_index()
+        stats.columns = ['scenario_id'] + [f'{col}_scen_{f}' for f in ['mean', 'max', 'min', 'std']]
+        df = df.merge(stats, on='scenario_id', how='left')
+
+    for col in ['congestion_score', 'order_per_station', 'pack_utilization', 'avg_trip_distance']:
+        sm = f'{col}_scen_mean'
+        if col in df.columns and sm in df.columns:
+            df[f'{col}_rel_to_scen'] = df[col] / (df[sm] + 1e-6)
+
+    for col in ['congestion_score', 'order_per_station', 'pack_utilization']:
+        if col in df.columns:
+            df[f'{col}_scen_rank'] = df.groupby('scenario_id')[col].rank(pct=True)
+    return df
+
+
+def add_layout_global_stats(df, layout_df):
+    """layout_id 전체 통계 (train+test 전부 같은 layout이므로 안전)."""
+    num_cols = layout_df.select_dtypes(include='number').columns.difference(['layout_id'])
+    for col in num_cols:
+        df[f'layout_{col}'] = df['layout_id'].map(layout_df.set_index('layout_id')[col])
+    return df
+
+
 def preprocess_all(df, layout_df):
     df = df.merge(layout_df, on='layout_id', how='left')
     df = handle_missing_values(df)
     df = add_basic_features(df)
     df = add_timeseries_features(df)
+    df = add_interaction_features(df)
     if 'layout_type' in df.columns:
         df['layout_type'] = pd.factorize(df['layout_type'])[0]
     return df
@@ -215,21 +265,40 @@ print(f"▶ preprocess done ({elapsed(t0)})")
 section('Target Encoding')
 t0 = time.time()
 TE_COLS = [c for c in ['layout_id', 'timeslot', 'layout_type', 'shift_hour', 'day_of_week'] if c in train.columns]
+TE_PAIRS = []
+for a in TE_COLS:
+    for b in TE_COLS:
+        if a < b:
+            TE_PAIRS.append((a, b))
+
 SMOOTHING = 20
 kf_te = GroupKFold(n_splits=N_FOLDS)
 groups_te = train['scenario_id']
-for col in TE_COLS:
-    te_col = f'{col}_te'
-    train[te_col] = np.nan
-    global_mean = train[TARGET].mean()
-    for tr_idx, val_idx in kf_te.split(train, train[TARGET], groups=groups_te):
-        tr_df = train.iloc[tr_idx]
-        stats = tr_df.groupby(col)[TARGET].agg(['mean', 'count'])
+global_mean = train[TARGET].mean()
+
+
+def _apply_te(df_train, df_test, col_name, group_col_series_tr, group_col_series_te):
+    te_col = f'{col_name}_te'
+    df_train[te_col] = np.nan
+    for tr_idx, val_idx in kf_te.split(df_train, df_train[TARGET], groups=groups_te):
+        tr_df = df_train.iloc[tr_idx]
+        stats = tr_df.groupby(group_col_series_tr.iloc[tr_idx])[TARGET].agg(['mean', 'count'])
         smooth = (stats['count'] * stats['mean'] + SMOOTHING * global_mean) / (stats['count'] + SMOOTHING)
-        train.loc[val_idx, te_col] = train.iloc[val_idx][col].map(smooth).fillna(global_mean)
-    stats_full = train.groupby(col)[TARGET].agg(['mean', 'count'])
+        df_train.loc[df_train.index[val_idx], te_col] = group_col_series_tr.iloc[val_idx].map(smooth).fillna(global_mean)
+    stats_full = df_train.groupby(group_col_series_tr)[TARGET].agg(['mean', 'count'])
     smooth_full = (stats_full['count'] * stats_full['mean'] + SMOOTHING * global_mean) / (stats_full['count'] + SMOOTHING)
-    test[te_col] = test[col].map(smooth_full).fillna(global_mean)
+    df_test[te_col] = group_col_series_te.map(smooth_full).fillna(global_mean)
+
+
+for col in TE_COLS:
+    _apply_te(train, test, col, train[col], test[col])
+
+for a, b in TE_PAIRS:
+    pair_name = f'{a}_X_{b}'
+    tr_key = train[a].astype(str) + '_' + train[b].astype(str)
+    te_key = test[a].astype(str) + '_' + test[b].astype(str)
+    _apply_te(train, test, pair_name, tr_key, te_key)
+
 print(f"▶ target encoding done ({elapsed(t0)})")
 
 
@@ -245,15 +314,16 @@ kf = GroupKFold(n_splits=N_FOLDS)
 
 lgb_params = dict(
     objective='regression_l1',
-    n_estimators=20000,
-    learning_rate=0.02,
-    max_depth=10,
+    n_estimators=25000,
+    learning_rate=0.015,
+    max_depth=-1,
     num_leaves=1023,
     min_child_samples=40,
-    subsample=0.8,
+    subsample=0.75,
     subsample_freq=1,
-    colsample_bytree=0.7,
-    reg_alpha=0.2,
+    colsample_bytree=0.5,
+    feature_fraction_bynode=0.5,
+    reg_alpha=0.3,
     reg_lambda=3.0,
     random_state=SEED,
     verbose=-1,
@@ -298,33 +368,34 @@ if RUN_LGB_GRID:
 
 xgb_params = dict(
     objective='reg:absoluteerror',
-    n_estimators=12000,
-    learning_rate=0.01,
-    max_depth=9,
-    subsample=0.8,
-    colsample_bytree=0.7,
-    reg_alpha=0.2,
-    reg_lambda=2.0,
+    n_estimators=20000,
+    learning_rate=0.015,
+    max_depth=10,
+    subsample=0.75,
+    colsample_bytree=0.5,
+    colsample_bynode=0.5,
+    reg_alpha=0.3,
+    reg_lambda=3.0,
     random_state=SEED,
     tree_method='hist',
     eval_metric='mae',
-    early_stopping_rounds=300,
+    early_stopping_rounds=500,
     verbosity=0,
 )
 
 cat_params = dict(
-    iterations=12000,
-    learning_rate=0.01,
-    depth=9,
-    l2_leaf_reg=6.0,
+    iterations=20000,
+    learning_rate=0.015,
+    depth=10,
+    l2_leaf_reg=5.0,
     bootstrap_type='MVS',
-    subsample=0.8,
-    colsample_bylevel=0.7,
+    subsample=0.75,
+    colsample_bylevel=0.5,
     loss_function='MAE',
     eval_metric='MAE',
     random_seed=SEED,
     task_type='CPU',
-    early_stopping_rounds=300,
+    early_stopping_rounds=500,
 )
 
 section('Train OOF')
@@ -395,15 +466,19 @@ if RUN_ENSEMBLE_SEARCH:
                 best_models = list(models)
                 best_p = float(p)
     print(f"▶ Best ensemble: models={best_models}  p={best_p}  OOF_MAE={best_search_mae:.6f}")
+    # best 결과를 실제 제출에도 적용 (LGB-only가 이기면 자동으로 LGB-only가 됨)
+    use_models = list(best_models)
+    WEIGHT_POWER = float(best_p)
 best_name = min(model_maes, key=model_maes.get)
 worst_name = max(model_maes, key=model_maes.get)
 best_mae = model_maes[best_name]
 worst_mae = model_maes[worst_name]
 
-use_models = ['lgb', 'xgb', 'cat']
-if AUTO_DROP_WORST and worst_mae > best_mae * (1 + DROP_WORST_IF_GAP_GT):
-    use_models.remove(worst_name)
-    print(f"▶ drop worst model: {worst_name} (best={best_name})")
+if 'use_models' not in globals():
+    use_models = ['lgb', 'xgb', 'cat']
+    if AUTO_DROP_WORST and worst_mae > best_mae * (1 + DROP_WORST_IF_GAP_GT):
+        use_models.remove(worst_name)
+        print(f"▶ drop worst model: {worst_name} (best={best_name})")
 
 def weight(name):
     return 1.0 / (model_maes[name] ** WEIGHT_POWER)
@@ -425,7 +500,80 @@ print(f"▶ Ensemble OOF MAE (models={use_models}, p={WEIGHT_POWER}): {ens_mae:.
 
 
 # ============================================================
-# 5) Test 예측 + 제출
+# 5) Stacking (2nd stage) — OOF predictions를 메타 피처로 사용
+# ============================================================
+section('Stacking 2nd stage')
+t0 = time.time()
+
+meta_train = pd.DataFrame({
+    'oof_lgb': oof_lgb,
+    'oof_xgb': oof_xgb,
+    'oof_cat': oof_cat,
+})
+meta_train['oof_mean'] = meta_train.mean(axis=1)
+meta_train['oof_std'] = meta_train[['oof_lgb', 'oof_xgb', 'oof_cat']].std(axis=1)
+meta_train['oof_max'] = meta_train[['oof_lgb', 'oof_xgb', 'oof_cat']].max(axis=1)
+meta_train['oof_min'] = meta_train[['oof_lgb', 'oof_xgb', 'oof_cat']].min(axis=1)
+
+top_feats = []
+if models_lgb:
+    imp = pd.Series(models_lgb[0].feature_importances_, index=feature_cols)
+    top_feats = imp.nlargest(30).index.tolist()
+for c in top_feats:
+    meta_train[c] = train[c].values
+
+meta_feature_cols = list(meta_train.columns)
+y_true_raw = train[TARGET].values
+
+stack_lgb_params = dict(
+    objective='regression_l1',
+    n_estimators=5000,
+    learning_rate=0.01,
+    num_leaves=31,
+    min_child_samples=50,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_lambda=5.0,
+    random_state=SEED,
+    verbose=-1,
+)
+
+oof_stack = np.zeros(len(train))
+models_stack = []
+kf_stack = GroupKFold(n_splits=N_FOLDS)
+for fold, (tr_idx, va_idx) in enumerate(kf_stack.split(meta_train, y_true_raw, groups=groups), 1):
+    X_tr = meta_train.iloc[tr_idx]
+    X_va = meta_train.iloc[va_idx]
+    y_tr = y_true_raw[tr_idx]
+    y_va = y_true_raw[va_idx]
+    ms = lgb.LGBMRegressor(**stack_lgb_params)
+    ms.fit(
+        X_tr, y_tr,
+        eval_set=[(X_va, y_va)],
+        eval_metric='mae',
+        callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(-1)],
+    )
+    oof_stack[va_idx] = ms.predict(X_va)
+    models_stack.append(ms)
+    print(f"  Stack fold {fold} MAE: {mae(y_va, oof_stack[va_idx]):.6f}")
+
+stack_mae = mae(y_true_raw, oof_stack)
+print(f"\n▶ Stacking OOF MAE: {stack_mae:.6f}  ({elapsed(t0)})")
+
+if stack_mae < ens_mae:
+    final_oof_mae = stack_mae
+    use_stacking = True
+    print("▶ Stacking wins -> 제출에 stacking 사용")
+else:
+    final_oof_mae = ens_mae
+    use_stacking = False
+    print("▶ Ensemble wins -> 제출에 1st-stage ensemble 사용")
+
+print(f"\n▶▶ FINAL OOF MAE: {final_oof_mae:.6f}")
+
+
+# ============================================================
+# 6) Test 예측 + 제출
 # ============================================================
 section('Predict test + submit')
 X_test = test[feature_cols]
@@ -434,14 +582,28 @@ p_lgb = np.mean([from_train_pred(m.predict(X_test)) for m in models_lgb], axis=0
 p_xgb = np.mean([from_train_pred(m.predict(X_test)) for m in models_xgb], axis=0)
 p_cat = np.mean([from_train_pred(m.predict(X_test)) for m in models_cat], axis=0)
 
-pred = 0.0
-if 'lgb' in use_models:
-    pred += w['lgb'] * p_lgb
-if 'xgb' in use_models:
-    pred += w['xgb'] * p_xgb
-if 'cat' in use_models:
-    pred += w['cat'] * p_cat
-pred = pred / w_sum
+if use_stacking:
+    meta_test = pd.DataFrame({
+        'oof_lgb': p_lgb,
+        'oof_xgb': p_xgb,
+        'oof_cat': p_cat,
+    })
+    meta_test['oof_mean'] = meta_test.mean(axis=1)
+    meta_test['oof_std'] = meta_test[['oof_lgb', 'oof_xgb', 'oof_cat']].std(axis=1)
+    meta_test['oof_max'] = meta_test[['oof_lgb', 'oof_xgb', 'oof_cat']].max(axis=1)
+    meta_test['oof_min'] = meta_test[['oof_lgb', 'oof_xgb', 'oof_cat']].min(axis=1)
+    for c in top_feats:
+        meta_test[c] = test[c].values
+    pred = np.mean([ms.predict(meta_test[meta_feature_cols]) for ms in models_stack], axis=0)
+else:
+    pred = 0.0
+    if 'lgb' in use_models:
+        pred += w['lgb'] * p_lgb
+    if 'xgb' in use_models:
+        pred += w['xgb'] * p_xgb
+    if 'cat' in use_models:
+        pred += w['cat'] * p_cat
+    pred = pred / w_sum
 
 pred = np.maximum(pred, CLIP_PRED_MIN)
 pred_hi = float(np.percentile(train[TARGET].values, 100 * CLIP_PRED_MAX_Q))
