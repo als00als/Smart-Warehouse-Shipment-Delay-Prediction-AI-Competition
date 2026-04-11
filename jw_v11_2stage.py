@@ -63,6 +63,23 @@ def mae(y_true, y_pred):
     return mean_absolute_error(y_true, y_pred)
 
 
+def _ensemble_pred(oof_by_model: dict[str, np.ndarray], maes_by_model: dict[str, float], models: list[str], p: float) -> np.ndarray:
+    w = {m: 1.0 / (maes_by_model[m] ** p) for m in models}
+    ws = sum(w.values())
+    out = np.zeros_like(next(iter(oof_by_model.values())))
+    for m in models:
+        out += w[m] * oof_by_model[m]
+    return out / ws
+
+
+def _powerset_models_s1():
+    return [
+        ['lgb'], ['xgb'], ['cat'],
+        ['lgb', 'xgb'], ['lgb', 'cat'], ['xgb', 'cat'],
+        ['lgb', 'xgb', 'cat'],
+    ]
+
+
 # ============================================================
 # 1) 데이터 로드
 # ============================================================
@@ -278,10 +295,44 @@ lgb_params_s1 = dict(
     verbose=-1,
 )
 
-section('Stage 1 - Base model (LGB only, fast)')
+xgb_params_s1 = dict(
+    objective='reg:absoluteerror',
+    n_estimators=20000,
+    learning_rate=0.015,
+    max_depth=10,
+    subsample=0.75,
+    colsample_bytree=0.5,
+    colsample_bynode=0.5,
+    reg_alpha=0.3,
+    reg_lambda=3.0,
+    random_state=SEED,
+    tree_method='hist',
+    eval_metric='mae',
+    early_stopping_rounds=500,
+    verbosity=0,
+)
+
+cat_params_s1 = dict(
+    iterations=20000,
+    learning_rate=0.015,
+    depth=10,
+    l2_leaf_reg=5.0,
+    bootstrap_type='MVS',
+    subsample=0.75,
+    colsample_bylevel=0.5,
+    loss_function='MAE',
+    eval_metric='MAE',
+    random_seed=SEED,
+    task_type='CPU',
+    early_stopping_rounds=500,
+)
+
+section('Stage 1 - Base model (LGB + XGB + Cat + ensemble)')
 t0 = time.time()
-oof_s1 = np.zeros(len(train))
-models_s1 = []
+oof_s1_lgb = np.zeros(len(train))
+oof_s1_xgb = np.zeros(len(train))
+oof_s1_cat = np.zeros(len(train))
+models_s1_lgb, models_s1_xgb, models_s1_cat = [], [], []
 
 for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1):
     X_tr = train.iloc[tr_idx][feature_cols_s1]
@@ -289,23 +340,114 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1
     y_tr = y_all[tr_idx]
     y_va = y_all[va_idx]
 
-    m = lgb.LGBMRegressor(**lgb_params_s1)
-    m.fit(
+    m_lgb = lgb.LGBMRegressor(**lgb_params_s1)
+    m_lgb.fit(
         X_tr, y_tr,
         eval_set=[(X_va, y_va)],
         eval_metric='mae',
         callbacks=[lgb.early_stopping(300, verbose=False), lgb.log_evaluation(-1)],
     )
-    oof_s1[va_idx] = from_train_pred(m.predict(X_va))
-    models_s1.append(m)
-    print(f"  S1 Fold {fold} MAE: {mae(y_raw[va_idx], oof_s1[va_idx]):.6f}")
+    oof_s1_lgb[va_idx] = from_train_pred(m_lgb.predict(X_va))
+    models_s1_lgb.append(m_lgb)
 
-s1_mae = mae(y_raw, oof_s1)
-print(f"\n▶ Stage 1 OOF MAE: {s1_mae:.6f}  ({elapsed(t0)})")
+    try:
+        m_xgb = xgb.XGBRegressor(**xgb_params_s1)
+        m_xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    except Exception:
+        xgb_fb = dict(xgb_params_s1)
+        xgb_fb['objective'] = 'reg:squarederror'
+        m_xgb = xgb.XGBRegressor(**xgb_fb)
+        m_xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+    oof_s1_xgb[va_idx] = from_train_pred(m_xgb.predict(X_va))
+    models_s1_xgb.append(m_xgb)
+
+    m_cat = cb.CatBoostRegressor(**cat_params_s1)
+    m_cat.fit(
+        X_tr, y_tr,
+        eval_set=(X_va, y_va),
+        verbose=max(1, cat_params_s1['iterations'] // 10),
+        use_best_model=True,
+    )
+    oof_s1_cat[va_idx] = from_train_pred(m_cat.predict(X_va))
+    models_s1_cat.append(m_cat)
+
+    ens = (oof_s1_lgb[va_idx] + oof_s1_xgb[va_idx] + oof_s1_cat[va_idx]) / 3
+    print(f"  S1 Fold {fold} MAE (avg3): {mae(y_raw[va_idx], ens):.6f}")
+
+mae_s1_lgb = mae(y_raw, oof_s1_lgb)
+mae_s1_xgb = mae(y_raw, oof_s1_xgb)
+mae_s1_cat = mae(y_raw, oof_s1_cat)
+print(f"\n▶ Stage 1 OOF MAE — LGB {mae_s1_lgb:.6f} | XGB {mae_s1_xgb:.6f} | CAT {mae_s1_cat:.6f}")
+
+s1_maes = {'lgb': mae_s1_lgb, 'xgb': mae_s1_xgb, 'cat': mae_s1_cat}
+s1_oof_by = {'lgb': oof_s1_lgb, 'xgb': oof_s1_xgb, 'cat': oof_s1_cat}
+
+best_s1_models = ['lgb', 'xgb', 'cat']
+best_s1_p = 2.0
+best_s1_mae = float('inf')
+for models in _powerset_models_s1():
+    for p in [1.0, 2.0, 3.0, 4.0]:
+        pred_tmp = _ensemble_pred(s1_oof_by, s1_maes, models, p)
+        m_val = mae(y_raw, pred_tmp)
+        if m_val < best_s1_mae:
+            best_s1_mae = float(m_val)
+            best_s1_models = list(models)
+            best_s1_p = float(p)
+
+print(f"▶ Best Stage1 ensemble: models={best_s1_models}  p={best_s1_p}  OOF_MAE={best_s1_mae:.6f}")
+
+w_s1 = {m: 1.0 / (s1_maes[m] ** best_s1_p) for m in best_s1_models}
+ws_s1 = sum(w_s1.values())
+oof_s1_pre = sum(w_s1[m] * s1_oof_by[m] for m in best_s1_models) / ws_s1
+s1_mae = mae(y_raw, oof_s1_pre)
+print(f"▶ Stage 1 ensemble OOF MAE: {s1_mae:.6f}  ({elapsed(t0)})")
+
+# Stage 1b: residual (OOF-safe) — base 예측 오차를 추가로 학습
+section('Stage 1b - Residual LGB (stack on Stage1 ensemble)')
+resid_params = dict(
+    objective='regression_l1',
+    n_estimators=8000,
+    learning_rate=0.02,
+    num_leaves=127,
+    min_child_samples=40,
+    subsample=0.8,
+    colsample_bytree=0.7,
+    reg_alpha=0.2,
+    reg_lambda=2.0,
+    random_state=SEED,
+    verbose=-1,
+)
+oof_s1_resid = np.zeros(len(train))
+models_s1_resid = []
+t1b = time.time()
+for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1):
+    X_tr = train.iloc[tr_idx][feature_cols_s1]
+    X_va = train.iloc[va_idx][feature_cols_s1]
+    r_tr = y_raw[tr_idx] - oof_s1_pre[tr_idx]
+    r_va = y_raw[va_idx] - oof_s1_pre[va_idx]
+    mr = lgb.LGBMRegressor(**resid_params)
+    mr.fit(
+        X_tr, r_tr,
+        eval_set=[(X_va, r_va)],
+        eval_metric='mae',
+        callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(-1)],
+    )
+    oof_s1_resid[va_idx] = mr.predict(X_va)
+    models_s1_resid.append(mr)
+    print(f"  S1b Fold {fold} residual MAE: {mae(r_va, oof_s1_resid[va_idx]):.6f}")
+
+oof_s1 = oof_s1_pre + oof_s1_resid
+s1_after_resid = mae(y_raw, oof_s1)
+print(f"\n▶ Stage 1 after residual OOF MAE: {s1_after_resid:.6f}  ({elapsed(t1b)})")
 
 X_test_s1 = test[feature_cols_s1]
-pred_s1_test = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1], axis=0)
-print(f"▶ Stage 1 test predictions ready")
+p_lgb = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_lgb], axis=0)
+p_xgb = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_xgb], axis=0)
+p_cat = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_cat], axis=0)
+pred_s1_pre = sum(w_s1[m] * {'lgb': p_lgb, 'xgb': p_xgb, 'cat': p_cat}[m] for m in best_s1_models) / ws_s1
+pred_resid_test = np.mean([m.predict(X_test_s1) for m in models_s1_resid], axis=0)
+pred_s1_test = pred_s1_pre + pred_resid_test
+print(f"▶ Stage 1 test predictions ready (ensemble + residual)")
 
 
 # ============================================================
