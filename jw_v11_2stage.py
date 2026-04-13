@@ -15,11 +15,116 @@ from sklearn.metrics import mean_absolute_error
 warnings.filterwarnings('ignore')
 
 # ============================================================
+# GPU / 백엔드 (cudf: 데이터·전처리·TE, cupy: 벡터 연산)
+# 환경변수 JW_V11_USE_GPU_DATA=0 / JW_V11_USE_GPU_NUMERIC=0 으로 끌 수 있음
+# ============================================================
+USE_GPU_DATA_PIPELINE = os.environ.get('JW_V11_USE_GPU_DATA', '1') != '0'
+USE_GPU_NUMERIC = os.environ.get('JW_V11_USE_GPU_NUMERIC', '1') != '0'
+
+
+def _try_import_cudf():
+    try:
+        import cudf  # type: ignore
+
+        _ = cudf.Series([1, 2, 3])
+        return cudf
+    except Exception:
+        return None
+
+
+def _try_import_cupy():
+    try:
+        import cupy as cp  # type: ignore
+
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            return None
+        return cp
+    except Exception:
+        return None
+
+
+CUDF = _try_import_cudf()
+CP = _try_import_cupy() if USE_GPU_NUMERIC else None
+
+
+def _is_cudf_df(obj) -> bool:
+    return CUDF is not None and isinstance(obj, CUDF.DataFrame)
+
+
+def _to_pandas_df(obj):
+    if _is_cudf_df(obj):
+        return obj.to_pandas()
+    return obj
+
+
+def _mae_vec(y_true, y_pred):
+    """OOF/그리드용 MAE. cupy 가능 시 GPU, 아니면 CPU."""
+    if CP is not None and USE_GPU_NUMERIC:
+        try:
+            yt = CP.asarray(np.asarray(y_true), dtype=CP.float64)
+            yp = CP.asarray(np.asarray(y_pred), dtype=CP.float64)
+            return float(CP.mean(CP.abs(yt - yp)))
+        except Exception:
+            pass
+    return float(mean_absolute_error(np.asarray(y_true), np.asarray(y_pred)))
+
+
+def _affine_blend(w_a, a, b):
+    """w_a * a + (1 - w_a) * b. cupy 시도 후 CPU."""
+    if CP is not None and USE_GPU_NUMERIC:
+        try:
+            ca = CP.asarray(np.asarray(a), dtype=CP.float64)
+            cb = CP.asarray(np.asarray(b), dtype=CP.float64)
+            return CP.asnumpy(w_a * ca + (1.0 - w_a) * cb)
+        except Exception:
+            pass
+    return (w_a * np.asarray(a, dtype=np.float64) + (1.0 - w_a) * np.asarray(b, dtype=np.float64)).astype(np.float64)
+
+
+def _clip_predictions(pred, y_train_raw):
+    """하한·분위 상한 클립. cupy 시도 후 CPU."""
+    if CP is not None and USE_GPU_NUMERIC:
+        try:
+            p = CP.asarray(np.asarray(pred), dtype=CP.float64)
+            p = CP.maximum(p, CLIP_PRED_MIN)
+            yref = CP.asarray(np.asarray(y_train_raw), dtype=CP.float64)
+            hi = CP.percentile(yref, 100.0 * CLIP_PRED_MAX_Q)
+            p = CP.minimum(p, hi)
+            return CP.asnumpy(p)
+        except Exception:
+            pass
+    pred = np.maximum(np.asarray(pred, dtype=np.float64), CLIP_PRED_MIN)
+    pred_hi = float(np.percentile(np.asarray(y_train_raw), 100.0 * CLIP_PRED_MAX_Q))
+    return np.minimum(pred, pred_hi).astype(np.float64)
+
+# ============================================================
 # 실행 파라미터
 # ============================================================
 N_FOLDS = 5
 SEED = 42
 USE_LOG_TARGET = False
+
+# Stage1 LGB: fold마다 아래 시드들을 각각 학습한 뒤 검증 구간 예측을 평균 (시간 × len(S1_LGB_SEEDS))
+# OOF 분산·소폭 개선에 쓰기 좋음. 예: S1_LGB_SEEDS = [42, 142, 242]
+S1_LGB_SEEDS = [SEED]
+
+# S1–S2 블렌드·expert_mix 탐색 간격 (0.02 등으로 촘촘히 → OOF 미세 개선, 루프만 증가)
+BLEND_ALPHA_STEP = 0.05
+EXPERT_MIX_STEP = 0.05
+
+# Fold 3처럼 어려운 시나리오가 한 fold에 몰리는 것 완화 (sklearn>=1.1)
+RUN_STRATIFIED_GROUP_CV = True
+# 최근 로그: S2 LGB-only OOF가 S1보다 크게 나쁨(8.65 vs 8.57) → 다시 3모델 앙상블 허용
+STAGE2_LGB_ONLY = False
+# Huber는 fold별 편차가 커질 수 있어 기본은 L1; 필요 시 True
+STAGE2_LGB_USE_HUBER = False
+# S2 OOF가 S1보다 나쁘면 blend/expert에서 S2 벡터를 S1으로 치환(제출에 악화 경로 차단)
+REPLACE_STAGE2_IF_NOT_IMPROVING = True
+
+# 제출 CSV만 바꿔 LB A/B (OOF·로그의 FINAL OOF는 그대로).
+# 예: set JW_V11_SUBMIT_PREDICTOR=base_blend
+#   auto = OOF에서 고른 best_final_name 그대로 | base_blend | s1_only | expert_only | expert_mix
+SUBMIT_PREDICTOR = os.environ.get('JW_V11_SUBMIT_PREDICTOR', 'auto').strip().lower()
 
 CLIP_PRED_MIN = 0.0
 CLIP_PRED_MAX_Q = 0.995
@@ -42,6 +147,14 @@ def section(title):
     print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
 
 
+def _grid_01(step: float) -> np.ndarray:
+    """[0,1] 구간 그리드 (끝점 1.0 포함)."""
+    if step <= 0 or step > 1:
+        step = 0.05
+    n = max(1, int(round(1.0 / step)))
+    return np.linspace(0.0, 1.0, n + 1)
+
+
 def _resolve_data_dir() -> str:
     here = Path.cwd().resolve()
     for p in [here, *here.parents]:
@@ -60,7 +173,7 @@ def from_train_pred(p):
 
 
 def mae(y_true, y_pred):
-    return mean_absolute_error(y_true, y_pred)
+    return _mae_vec(y_true, y_pred)
 
 
 def _ensemble_pred(oof_by_model: dict[str, np.ndarray], maes_by_model: dict[str, float], models: list[str], p: float) -> np.ndarray:
@@ -81,22 +194,7 @@ def _powerset_models_s1():
 
 
 # ============================================================
-# 1) 데이터 로드
-# ============================================================
-path = _resolve_data_dir()
-project_root = str(Path(path).resolve().parent)
-print(f"▶ data dir: {path}")
-print(f"▶ project root: {project_root}")
-
-t0 = time.time()
-train = pd.read_csv(os.path.join(path, 'train.csv'))
-test = pd.read_csv(os.path.join(path, 'test.csv'))
-layout = pd.read_csv(os.path.join(path, 'layout_info.csv'))
-print(f"▶ load done ({elapsed(t0)})  train {len(train):,} / test {len(test):,}")
-
-
-# ============================================================
-# 2) 전처리  (Stage 1 & 2 공통)
+# 전처리 함수 (Stage 1 & 2 공통; cudf/pandas 동시 지원)
 # ============================================================
 def handle_missing_values(df):
     df = df.sort_values(['scenario_id', 'ID']).reset_index(drop=True)
@@ -214,36 +312,15 @@ def preprocess_all(df, layout_df):
     df = add_timeseries_features(df)
     df = add_interaction_features(df)
     if 'layout_type' in df.columns:
-        df['layout_type'] = pd.factorize(df['layout_type'])[0]
+        if _is_cudf_df(df):
+            codes, _ = df['layout_type'].factorize()
+            df['layout_type'] = codes
+        else:
+            df['layout_type'] = pd.factorize(df['layout_type'])[0]
     return df
 
 
-section('Preprocess')
-t0 = time.time()
-train = preprocess_all(train, layout)
-test = preprocess_all(test, layout)
-print(f"▶ preprocess done ({elapsed(t0)})")
-
-
-# ============================================================
-# 3) 타겟 인코딩 (OOF)
-# ============================================================
-section('Target Encoding')
-t0 = time.time()
-TE_COLS = [c for c in ['layout_id', 'timeslot', 'layout_type', 'shift_hour', 'day_of_week'] if c in train.columns]
-TE_PAIRS = []
-for a in TE_COLS:
-    for b in TE_COLS:
-        if a < b:
-            TE_PAIRS.append((a, b))
-
-SMOOTHING = 20
-kf_te = GroupKFold(n_splits=N_FOLDS)
-groups_te = train['scenario_id']
-global_mean = train[TARGET].mean()
-
-
-def _apply_te(df_train, df_test, col_name, group_col_series_tr, group_col_series_te):
+def _apply_te(df_train, df_test, col_name, group_col_series_tr, group_col_series_te, kf_te, groups_te, global_mean):
     te_col = f'{col_name}_te'
     df_train[te_col] = np.nan
     for tr_idx, val_idx in kf_te.split(df_train, df_train[TARGET], groups=groups_te):
@@ -256,17 +333,120 @@ def _apply_te(df_train, df_test, col_name, group_col_series_tr, group_col_series
     df_test[te_col] = group_col_series_te.map(smooth_full).fillna(global_mean)
 
 
-for col in TE_COLS:
-    _apply_te(train, test, col, train[col], test[col])
+def _run_target_encoding(train_df, test_df):
+    kf_te = GroupKFold(n_splits=N_FOLDS)
+    groups_te = train_df['scenario_id']
+    gm = float(train_df[TARGET].mean())
+    TE_COLS_LOCAL = [c for c in ['layout_id', 'timeslot', 'layout_type', 'shift_hour', 'day_of_week'] if c in train_df.columns]
+    TE_PAIRS_LOCAL = []
+    for a in TE_COLS_LOCAL:
+        for b in TE_COLS_LOCAL:
+            if a < b:
+                TE_PAIRS_LOCAL.append((a, b))
+    for col in TE_COLS_LOCAL:
+        _apply_te(train_df, test_df, col, train_df[col], test_df[col], kf_te, groups_te, gm)
+    for a, b in TE_PAIRS_LOCAL:
+        pair_name = f'{a}_X_{b}'
+        tr_key = train_df[a].astype(str) + '_' + train_df[b].astype(str)
+        te_key = test_df[a].astype(str) + '_' + test_df[b].astype(str)
+        _apply_te(train_df, test_df, pair_name, tr_key, te_key, kf_te, groups_te, gm)
+    return TE_COLS_LOCAL, TE_PAIRS_LOCAL
 
-for a, b in TE_PAIRS:
-    pair_name = f'{a}_X_{b}'
-    tr_key = train[a].astype(str) + '_' + train[b].astype(str)
-    te_key = test[a].astype(str) + '_' + test[b].astype(str)
-    _apply_te(train, test, pair_name, tr_key, te_key)
 
-print(f"▶ target encoding done ({elapsed(t0)})")
+# ============================================================
+# 1) 데이터 로드  (GPU: cudf 시도 → 실패 시 pandas)
+# ============================================================
+path = _resolve_data_dir()
+project_root = str(Path(path).resolve().parent)
+print(f"▶ data dir: {path}")
+print(f"▶ project root: {project_root}")
 
+_data_gpu_ok = False
+t0 = time.time()
+if USE_GPU_DATA_PIPELINE and CUDF is not None:
+    try:
+        train = CUDF.read_csv(os.path.join(path, 'train.csv'))
+        test = CUDF.read_csv(os.path.join(path, 'test.csv'))
+        layout = CUDF.read_csv(os.path.join(path, 'layout_info.csv'))
+        _data_gpu_ok = True
+        print(f"▶ load: GPU (cudf)  train {len(train):,} / test {len(test):,}  ({elapsed(t0)})")
+    except Exception as e:
+        print(f"▶ load: cudf 실패 → CPU pandas ({e})")
+        train = pd.read_csv(os.path.join(path, 'train.csv'))
+        test = pd.read_csv(os.path.join(path, 'test.csv'))
+        layout = pd.read_csv(os.path.join(path, 'layout_info.csv'))
+        print(f"▶ load done ({elapsed(t0)})  train {len(train):,} / test {len(test):,}")
+else:
+    train = pd.read_csv(os.path.join(path, 'train.csv'))
+    test = pd.read_csv(os.path.join(path, 'test.csv'))
+    layout = pd.read_csv(os.path.join(path, 'layout_info.csv'))
+    print(f"▶ load: CPU (pandas)  train {len(train):,} / test {len(test):,}  ({elapsed(t0)})")
+
+
+# ============================================================
+# 2) 전처리  (GPU: cudf 시도 → 실패 시 CSV에서 pandas로 재시도)
+# ============================================================
+section('Preprocess')
+t0 = time.time()
+if _data_gpu_ok:
+    try:
+        train = preprocess_all(train, layout)
+        test = preprocess_all(test, layout)
+        print(f"▶ preprocess: GPU (cudf) done ({elapsed(t0)})")
+    except Exception as e:
+        print(f"▶ preprocess: GPU 실패 → CPU 재로드·pandas ({e})")
+        layout_pd = _to_pandas_df(layout)
+        train = pd.read_csv(os.path.join(path, 'train.csv'))
+        test = pd.read_csv(os.path.join(path, 'test.csv'))
+        layout = layout_pd if isinstance(layout_pd, pd.DataFrame) else pd.read_csv(os.path.join(path, 'layout_info.csv'))
+        train = preprocess_all(train, layout)
+        test = preprocess_all(test, layout)
+        _data_gpu_ok = False
+        print(f"▶ preprocess done (CPU) ({elapsed(t0)})")
+else:
+    train = preprocess_all(train, layout)
+    test = preprocess_all(test, layout)
+    print(f"▶ preprocess done ({elapsed(t0)})")
+
+
+# ============================================================
+# 3) 타겟 인코딩 (OOF)  (GPU: cudf 유지 시도 → 실패 시 pandas로 전환 후 재실행)
+# ============================================================
+section('Target Encoding')
+t0 = time.time()
+SMOOTHING = 20
+TE_COLS = []
+TE_PAIRS = []
+
+if _data_gpu_ok and _is_cudf_df(train):
+    try:
+        TE_COLS, TE_PAIRS = _run_target_encoding(train, test)
+        print(f"▶ target encoding: GPU (cudf) done ({elapsed(t0)})")
+    except Exception as e:
+        print(f"▶ target encoding: GPU 실패 → CPU pandas ({e})")
+        train = pd.read_csv(os.path.join(path, 'train.csv'))
+        test = pd.read_csv(os.path.join(path, 'test.csv'))
+        layout = pd.read_csv(os.path.join(path, 'layout_info.csv'))
+        train = preprocess_all(train, layout)
+        test = preprocess_all(test, layout)
+        TE_COLS, TE_PAIRS = _run_target_encoding(train, test)
+        _data_gpu_ok = False
+        print(f"▶ target encoding done (CPU) ({elapsed(t0)})")
+else:
+    TE_COLS, TE_PAIRS = _run_target_encoding(train, test)
+    print(f"▶ target encoding done ({elapsed(t0)})")
+
+# GBDT / sklearn CV는 pandas + CPU 고정
+train = _to_pandas_df(train)
+test = _to_pandas_df(test)
+layout = _to_pandas_df(layout)
+print("▶ Stage1/Stage2/Expert LGB·XGB·Cat: CPU (tree_method=hist / task_type=CPU)")
+if CP is not None and USE_GPU_NUMERIC:
+    print("▶ 벡터 구간(앙상블·블렌드·lag·테스트 후처리): GPU (cupy)")
+else:
+    print("▶ 벡터 구간: CPU (cupy 없음 또는 JW_V11_USE_GPU_NUMERIC=0)")
+
+global_mean = float(train[TARGET].mean())
 
 # ============================================================
 # 4) Stage 1: Base Model (target lag 없음)
@@ -277,7 +457,31 @@ print(f"▶ Stage 1 features: {len(feature_cols_s1)}")
 y_all = to_train_target(train[TARGET].values)
 y_raw = train[TARGET].values
 groups = train['scenario_id'].values
-kf = GroupKFold(n_splits=N_FOLDS)
+
+# CV용 층화 라벨: 시나리오별 타깃 평균을 분위로 이산화 (같은 시나리오 행은 동일 라벨)
+_scen_mean = train.groupby('scenario_id')[TARGET].transform('mean')
+try:
+    y_strat_cv = pd.qcut(_scen_mean, q=10, labels=False, duplicates='drop')
+    y_strat_cv = pd.Series(y_strat_cv).fillna(0).astype(np.int64).values
+except Exception:
+    y_strat_cv = np.zeros(len(train), dtype=np.int64)
+
+kf_y = y_strat_cv
+if RUN_STRATIFIED_GROUP_CV:
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        kf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+        kf_y = y_strat_cv
+        print('▶ CV: StratifiedGroupKFold (scenario target deciles)')
+    except Exception as e:
+        kf = GroupKFold(n_splits=N_FOLDS)
+        kf_y = y_all
+        print(f'▶ CV: GroupKFold (StratifiedGroupKFold unavailable: {e})')
+else:
+    kf = GroupKFold(n_splits=N_FOLDS)
+    kf_y = y_all
+    print('▶ CV: GroupKFold')
 
 lgb_params_s1 = dict(
     objective='regression_l1',
@@ -328,27 +532,33 @@ cat_params_s1 = dict(
 )
 
 section('Stage 1 - Base model (LGB + XGB + Cat + ensemble)')
+if len(S1_LGB_SEEDS) > 1:
+    print(f"▶ S1 LGB multi-seed (fold 내 평균): {S1_LGB_SEEDS}")
 t0 = time.time()
 oof_s1_lgb = np.zeros(len(train))
 oof_s1_xgb = np.zeros(len(train))
 oof_s1_cat = np.zeros(len(train))
 models_s1_lgb, models_s1_xgb, models_s1_cat = [], [], []
 
-for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1):
+for fold, (tr_idx, va_idx) in enumerate(kf.split(train, kf_y, groups=groups), 1):
     X_tr = train.iloc[tr_idx][feature_cols_s1]
     X_va = train.iloc[va_idx][feature_cols_s1]
     y_tr = y_all[tr_idx]
     y_va = y_all[va_idx]
 
-    m_lgb = lgb.LGBMRegressor(**lgb_params_s1)
-    m_lgb.fit(
-        X_tr, y_tr,
-        eval_set=[(X_va, y_va)],
-        eval_metric='mae',
-        callbacks=[lgb.early_stopping(300, verbose=False), lgb.log_evaluation(-1)],
-    )
-    oof_s1_lgb[va_idx] = from_train_pred(m_lgb.predict(X_va))
-    models_s1_lgb.append(m_lgb)
+    lgb_va_stack = []
+    for rs in S1_LGB_SEEDS:
+        lp = {**lgb_params_s1, 'random_state': rs}
+        m_lgb = lgb.LGBMRegressor(**lp)
+        m_lgb.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            eval_metric='mae',
+            callbacks=[lgb.early_stopping(300, verbose=False), lgb.log_evaluation(-1)],
+        )
+        lgb_va_stack.append(from_train_pred(m_lgb.predict(X_va)))
+        models_s1_lgb.append(m_lgb)
+    oof_s1_lgb[va_idx] = np.mean(lgb_va_stack, axis=0)
 
     try:
         m_xgb = xgb.XGBRegressor(**xgb_params_s1)
@@ -399,8 +609,8 @@ print(f"▶ Best Stage1 ensemble: models={best_s1_models}  p={best_s1_p}  OOF_MA
 w_s1 = {m: 1.0 / (s1_maes[m] ** best_s1_p) for m in best_s1_models}
 ws_s1 = sum(w_s1.values())
 oof_s1_pre = sum(w_s1[m] * s1_oof_by[m] for m in best_s1_models) / ws_s1
-s1_mae = mae(y_raw, oof_s1_pre)
-print(f"▶ Stage 1 ensemble OOF MAE: {s1_mae:.6f}  ({elapsed(t0)})")
+s1_pre_mae = mae(y_raw, oof_s1_pre)
+print(f"▶ Stage 1 ensemble OOF MAE (pre-residual): {s1_pre_mae:.6f}  ({elapsed(t0)})")
 
 # Stage 1b: residual (OOF-safe) — base 예측 오차를 추가로 학습
 section('Stage 1b - Residual LGB (stack on Stage1 ensemble)')
@@ -420,7 +630,7 @@ resid_params = dict(
 oof_s1_resid = np.zeros(len(train))
 models_s1_resid = []
 t1b = time.time()
-for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1):
+for fold, (tr_idx, va_idx) in enumerate(kf.split(train, kf_y, groups=groups), 1):
     X_tr = train.iloc[tr_idx][feature_cols_s1]
     X_va = train.iloc[va_idx][feature_cols_s1]
     r_tr = y_raw[tr_idx] - oof_s1_pre[tr_idx]
@@ -437,8 +647,8 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1
     print(f"  S1b Fold {fold} residual MAE: {mae(r_va, oof_s1_resid[va_idx]):.6f}")
 
 oof_s1 = oof_s1_pre + oof_s1_resid
-s1_after_resid = mae(y_raw, oof_s1)
-print(f"\n▶ Stage 1 after residual OOF MAE: {s1_after_resid:.6f}  ({elapsed(t1b)})")
+s1_mae = mae(y_raw, oof_s1)
+print(f"\n▶ Stage 1 after residual OOF MAE: {s1_mae:.6f}  ({elapsed(t1b)})")
 
 X_test_s1 = test[feature_cols_s1]
 p_lgb = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_lgb], axis=0)
@@ -455,7 +665,28 @@ print(f"▶ Stage 1 test predictions ready (ensemble + residual)")
 # ============================================================
 def build_pred_lag_features(df, pred_col_name, gm):
     """pred_col_name 컬럼의 shifted 값으로 lag 피처 생성.
-    df는 scenario_id, ID 순으로 정렬되어 있어야 함."""
+    df는 scenario_id, ID 순으로 정렬되어 있어야 함.
+    GPU: cudf groupby/shift/rolling 시도 → 실패 시 pandas CPU."""
+    if CUDF is not None and USE_GPU_NUMERIC:
+        try:
+            sub = df[['scenario_id', 'ID', pred_col_name]].copy()
+            gdf = CUDF.from_pandas(sub)
+            g = gdf.groupby('scenario_id')[pred_col_name]
+            gdf['pred_lag1'] = g.shift(1).fillna(gm)
+            gdf['pred_lag2'] = g.shift(2).fillna(gm)
+            gdf['pred_lag3'] = g.shift(3).fillna(gm)
+            gdf['pred_lag_diff'] = gdf['pred_lag1'] - gdf['pred_lag2']
+            gdf['pred_lag_roll3'] = g.transform(
+                lambda x: x.shift(1).rolling(3, min_periods=1).mean()
+            ).fillna(gm)
+            lag_pdf = gdf[['pred_lag1', 'pred_lag2', 'pred_lag3', 'pred_lag_diff', 'pred_lag_roll3']].to_pandas()
+            for c in lag_pdf.columns:
+                df[c] = lag_pdf[c].to_numpy(copy=False)
+            pl1 = np.asarray(df['pred_lag1'], dtype=np.float64)
+            df['pred_lag1_log'] = np.log1p(np.maximum(pl1, 0.0))
+            return df
+        except Exception:
+            pass
     g = df.groupby('scenario_id')[pred_col_name]
     df['pred_lag1'] = g.shift(1).fillna(gm)
     df['pred_lag2'] = g.shift(2).fillna(gm)
@@ -476,7 +707,7 @@ def build_pred_lag_features(df, pred_col_name, gm):
 feature_cols_s2 = feature_cols_s1 + PRED_LAG_COLS
 
 lgb_params_s2 = dict(
-    objective='regression_l1',
+    objective='huber' if STAGE2_LGB_USE_HUBER else 'regression_l1',
     n_estimators=25000,
     learning_rate=0.01,
     max_depth=-1,
@@ -490,6 +721,8 @@ lgb_params_s2 = dict(
     random_state=SEED,
     verbose=-1,
 )
+if STAGE2_LGB_USE_HUBER:
+    lgb_params_s2['alpha'] = 0.9
 
 xgb_params_s2 = dict(
     objective='reg:absoluteerror',
@@ -523,7 +756,7 @@ cat_params_s2 = dict(
     early_stopping_rounds=500,
 )
 
-section('Stage 2 - Lag-enhanced model (LGB + XGB + CAT)')
+section('Stage 2 - Lag-enhanced (LGB only)' if STAGE2_LGB_ONLY else 'Stage 2 - Lag-enhanced (LGB + XGB + CAT)')
 t0 = time.time()
 
 train['_s1_pred'] = oof_s1
@@ -537,7 +770,7 @@ oof_s2_xgb = np.zeros(len(train))
 oof_s2_cat = np.zeros(len(train))
 models_s2_lgb, models_s2_xgb, models_s2_cat = [], [], []
 
-for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1):
+for fold, (tr_idx, va_idx) in enumerate(kf.split(train, kf_y, groups=groups), 1):
     print(f"\n  --- Stage 2 Fold {fold} ---")
 
     X_tr = train.iloc[tr_idx][feature_cols_s2]
@@ -558,80 +791,101 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1
     models_s2_lgb.append(m_lgb)
     print(f"    LGB MAE: {mae(y_raw[va_idx], oof_s2_lgb[va_idx]):.6f}")
 
-    # XGB
-    try:
-        m_xgb = xgb.XGBRegressor(**xgb_params_s2)
-        m_xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-    except Exception:
-        xgb_fb = dict(xgb_params_s2)
-        xgb_fb['objective'] = 'reg:squarederror'
-        m_xgb = xgb.XGBRegressor(**xgb_fb)
-        m_xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
-    oof_s2_xgb[va_idx] = from_train_pred(m_xgb.predict(X_va))
-    models_s2_xgb.append(m_xgb)
-    print(f"    XGB MAE: {mae(y_raw[va_idx], oof_s2_xgb[va_idx]):.6f}")
+    if not STAGE2_LGB_ONLY:
+        # XGB
+        try:
+            m_xgb = xgb.XGBRegressor(**xgb_params_s2)
+            m_xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        except Exception:
+            xgb_fb = dict(xgb_params_s2)
+            xgb_fb['objective'] = 'reg:squarederror'
+            m_xgb = xgb.XGBRegressor(**xgb_fb)
+            m_xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        oof_s2_xgb[va_idx] = from_train_pred(m_xgb.predict(X_va))
+        models_s2_xgb.append(m_xgb)
+        print(f"    XGB MAE: {mae(y_raw[va_idx], oof_s2_xgb[va_idx]):.6f}")
 
-    # CAT
-    m_cat = cb.CatBoostRegressor(**cat_params_s2)
-    m_cat.fit(
-        X_tr, y_tr,
-        eval_set=(X_va, y_va),
-        verbose=max(1, cat_params_s2['iterations'] // 5),
-        use_best_model=True,
-    )
-    oof_s2_cat[va_idx] = from_train_pred(m_cat.predict(X_va))
-    models_s2_cat.append(m_cat)
-    print(f"    CAT MAE: {mae(y_raw[va_idx], oof_s2_cat[va_idx]):.6f}")
+        # CAT
+        m_cat = cb.CatBoostRegressor(**cat_params_s2)
+        m_cat.fit(
+            X_tr, y_tr,
+            eval_set=(X_va, y_va),
+            verbose=max(1, cat_params_s2['iterations'] // 5),
+            use_best_model=True,
+        )
+        oof_s2_cat[va_idx] = from_train_pred(m_cat.predict(X_va))
+        models_s2_cat.append(m_cat)
+        print(f"    CAT MAE: {mae(y_raw[va_idx], oof_s2_cat[va_idx]):.6f}")
 
-    avg3 = (oof_s2_lgb[va_idx] + oof_s2_xgb[va_idx] + oof_s2_cat[va_idx]) / 3
-    print(f"    AVG MAE: {mae(y_raw[va_idx], avg3):.6f}")
+        avg3 = (oof_s2_lgb[va_idx] + oof_s2_xgb[va_idx] + oof_s2_cat[va_idx]) / 3
+        print(f"    AVG MAE: {mae(y_raw[va_idx], avg3):.6f}")
 
 mae_s2_lgb = mae(y_raw, oof_s2_lgb)
-mae_s2_xgb = mae(y_raw, oof_s2_xgb)
-mae_s2_cat = mae(y_raw, oof_s2_cat)
-print(f"\n▶ Stage 2 OOF MAE - LGB {mae_s2_lgb:.6f} | XGB {mae_s2_xgb:.6f} | CAT {mae_s2_cat:.6f}")
+if STAGE2_LGB_ONLY:
+    mae_s2_xgb = float('nan')
+    mae_s2_cat = float('nan')
+    print(f"\n▶ Stage 2 OOF MAE - LGB {mae_s2_lgb:.6f}  (XGB/CAT skipped)")
+else:
+    mae_s2_xgb = mae(y_raw, oof_s2_xgb)
+    mae_s2_cat = mae(y_raw, oof_s2_cat)
+    print(f"\n▶ Stage 2 OOF MAE - LGB {mae_s2_lgb:.6f} | XGB {mae_s2_xgb:.6f} | CAT {mae_s2_cat:.6f}")
 
 
 # ============================================================
 # 7) Stage 2 앙상블 최적화
 # ============================================================
 section('Stage 2 Ensemble search')
-s2_model_maes = {'lgb': mae_s2_lgb, 'xgb': mae_s2_xgb, 'cat': mae_s2_cat}
-s2_oof_by = {'lgb': oof_s2_lgb, 'xgb': oof_s2_xgb, 'cat': oof_s2_cat}
+if STAGE2_LGB_ONLY:
+    oof_s2_ens = oof_s2_lgb.copy()
+    s2_ens_mae = mae(y_raw, oof_s2_ens)
+    best_s2_models = ['lgb']
+    best_s2_p = 1.0
+    w_s2 = {'lgb': 1.0}
+    ws_s2 = 1.0
+    print(f"▶ Stage 2 LGB-only OOF MAE: {s2_ens_mae:.6f}")
+else:
+    s2_model_maes = {'lgb': mae_s2_lgb, 'xgb': mae_s2_xgb, 'cat': mae_s2_cat}
+    s2_oof_by = {'lgb': oof_s2_lgb, 'xgb': oof_s2_xgb, 'cat': oof_s2_cat}
 
-def _powerset():
-    return [
-        ["lgb"], ["xgb"], ["cat"],
-        ["lgb", "xgb"], ["lgb", "cat"], ["xgb", "cat"],
-        ["lgb", "xgb", "cat"],
-    ]
+    def _powerset():
+        return [
+            ["lgb"], ["xgb"], ["cat"],
+            ["lgb", "xgb"], ["lgb", "cat"], ["xgb", "cat"],
+            ["lgb", "xgb", "cat"],
+        ]
 
-best_s2_models = None
-best_s2_p = None
-best_s2_mae = float('inf')
-for models in _powerset():
-    for p in [1.0, 2.0, 3.0, 4.0]:
-        w = {m: 1.0 / (s2_model_maes[m] ** p) for m in models}
-        ws = sum(w.values())
-        pred_tmp = sum(w[m] * s2_oof_by[m] for m in models) / ws
-        m_val = mae(y_raw, pred_tmp)
-        if m_val < best_s2_mae:
-            best_s2_mae = float(m_val)
-            best_s2_models = list(models)
-            best_s2_p = float(p)
+    best_s2_models = None
+    best_s2_p = None
+    best_s2_mae = float('inf')
+    for models in _powerset():
+        for p in [1.0, 2.0, 3.0, 4.0]:
+            w = {m: 1.0 / (s2_model_maes[m] ** p) for m in models}
+            ws = sum(w.values())
+            pred_tmp = sum(w[m] * s2_oof_by[m] for m in models) / ws
+            m_val = mae(y_raw, pred_tmp)
+            if m_val < best_s2_mae:
+                best_s2_mae = float(m_val)
+                best_s2_models = list(models)
+                best_s2_p = float(p)
 
-print(f"▶ Best S2 ensemble: models={best_s2_models}  p={best_s2_p}  OOF_MAE={best_s2_mae:.6f}")
+    print(f"▶ Best S2 ensemble: models={best_s2_models}  p={best_s2_p}  OOF_MAE={best_s2_mae:.6f}")
 
-# build S2 ensemble OOF
-w_s2 = {m: 1.0 / (s2_model_maes[m] ** best_s2_p) for m in best_s2_models}
-ws_s2 = sum(w_s2.values())
-oof_s2_ens = sum(w_s2[m] * s2_oof_by[m] for m in best_s2_models) / ws_s2
-s2_ens_mae = mae(y_raw, oof_s2_ens)
-print(f"▶ Stage 2 Ensemble OOF MAE: {s2_ens_mae:.6f}")
+    w_s2 = {m: 1.0 / (s2_model_maes[m] ** best_s2_p) for m in best_s2_models}
+    ws_s2 = sum(w_s2.values())
+    oof_s2_ens = sum(w_s2[m] * s2_oof_by[m] for m in best_s2_models) / ws_s2
+    s2_ens_mae = mae(y_raw, oof_s2_ens)
+    print(f"▶ Stage 2 Ensemble OOF MAE: {s2_ens_mae:.6f}")
 
 print(f"\n▶ Stage 1 OOF MAE: {s1_mae:.6f}")
 print(f"▶ Stage 2 OOF MAE: {s2_ens_mae:.6f}")
 print(f"▶ Improvement: {s1_mae - s2_ens_mae:.6f}")
+
+oof_s2_used = oof_s2_ens
+use_s1_instead_of_s2 = False
+if REPLACE_STAGE2_IF_NOT_IMPROVING and s2_ens_mae >= s1_mae:
+    print("▶ REPLACE: Stage2 OOF >= Stage1 → 이후 blend/expert/S2 제출경로는 S1과 동일 OOF 사용")
+    oof_s2_used = oof_s1.copy()
+    use_s1_instead_of_s2 = True
 
 
 # ============================================================
@@ -639,22 +893,23 @@ print(f"▶ Improvement: {s1_mae - s2_ens_mae:.6f}")
 # ============================================================
 section('Stage 1 + Stage 2 blending')
 best_alpha = 0.0
-best_blend_mae = s2_ens_mae
-for alpha in np.arange(0.0, 1.01, 0.05):
-    blend_pred = alpha * oof_s1 + (1 - alpha) * oof_s2_ens
+best_blend_mae = mae(y_raw, oof_s2_used)
+_alpha_grid = _grid_01(BLEND_ALPHA_STEP)
+for i_alpha, alpha in enumerate(_alpha_grid):
+    blend_pred = _affine_blend(alpha, oof_s1, oof_s2_used)
     m_val = mae(y_raw, blend_pred)
     if m_val < best_blend_mae:
         best_blend_mae = float(m_val)
         best_alpha = float(alpha)
-    if abs(alpha - 0.0) < 0.01 or abs(alpha - 1.0) < 0.01 or abs(alpha - 0.5) < 0.01:
-        print(f"  alpha={alpha:.2f} MAE={m_val:.6f}")
+    if i_alpha in (0, len(_alpha_grid) // 2, len(_alpha_grid) - 1):
+        print(f"  alpha={alpha:.4f} MAE={m_val:.6f}")
 
 print(f"\n▶ Best blend: alpha={best_alpha:.2f} (S1 weight)  MAE={best_blend_mae:.6f}")
 
 # ============================================================
 # 8-B) Timeslot expert heads (slot0 vs slot1+)
 # ============================================================
-section('Timeslot expert heads')
+section('Timeslot expert heads (LGB 학습·추론: CPU / OOF·그리드 MAE: cupy 선택)')
 
 slot0_mask = (train['timeslot'].values == 0)
 slotn_mask = ~slot0_mask
@@ -691,7 +946,7 @@ oof_expert = np.zeros(len(train))
 models_slot0 = []
 models_slotn = []
 
-for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_all, groups=groups), 1):
+for fold, (tr_idx, va_idx) in enumerate(kf.split(train, kf_y, groups=groups), 1):
     tr_df = train.iloc[tr_idx]
     va_df = train.iloc[va_idx]
 
@@ -736,7 +991,7 @@ print(f"▶ Expert OOF MAE: {expert_mae:.6f}")
 
 # 최종 후보 비교: 기존 blend vs expert vs 둘의 blend
 best_final_name = "base_stage2_blend"
-best_final_oof = best_alpha * oof_s1 + (1 - best_alpha) * oof_s2_ens
+best_final_oof = _affine_blend(best_alpha, oof_s1, oof_s2_used)
 best_final_mae = best_blend_mae
 
 if expert_mae < best_final_mae:
@@ -745,8 +1000,9 @@ if expert_mae < best_final_mae:
     best_final_mae = expert_mae
 
 best_mix_w = 0.0
-for w_mix in np.arange(0.0, 1.01, 0.05):
-    mix_pred = w_mix * oof_expert + (1 - w_mix) * (best_alpha * oof_s1 + (1 - best_alpha) * oof_s2_ens)
+base_b = _affine_blend(best_alpha, oof_s1, oof_s2_used)
+for w_mix in _grid_01(EXPERT_MIX_STEP):
+    mix_pred = _affine_blend(w_mix, oof_expert, base_b)
     mix_mae = mae(y_raw, mix_pred)
     if mix_mae < best_final_mae:
         best_final_mae = mix_mae
@@ -776,15 +1032,18 @@ X_test_s2 = test[feature_cols_s2]
 
 # Stage 2 각 모델의 fold별 예측 평균
 p_s2_lgb = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_lgb], axis=0)
-p_s2_xgb = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_xgb], axis=0)
-p_s2_cat = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_cat], axis=0)
+if STAGE2_LGB_ONLY:
+    pred_s2_test = p_s2_lgb
+else:
+    p_s2_xgb = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_xgb], axis=0)
+    p_s2_cat = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_cat], axis=0)
+    pred_s2_test = sum(w_s2[m] * {'lgb': p_s2_lgb, 'xgb': p_s2_xgb, 'cat': p_s2_cat}[m]
+                       for m in best_s2_models) / ws_s2
 
-# Stage 2 앙상블
-pred_s2_test = sum(w_s2[m] * {'lgb': p_s2_lgb, 'xgb': p_s2_xgb, 'cat': p_s2_cat}[m]
-                   for m in best_s2_models) / ws_s2
+pred_s2_test_blend = pred_s1_test if use_s1_instead_of_s2 else pred_s2_test
 
-# 기존 최적 blend 예측
-pred_blend = best_alpha * pred_s1_test + (1 - best_alpha) * pred_s2_test
+# 기존 최적 blend 예측 (벡터: cupy 선택)
+pred_blend = _affine_blend(best_alpha, pred_s1_test, pred_s2_test_blend)
 
 # expert test 예측
 test_slot0 = (test['timeslot'].values == 0)
@@ -801,20 +1060,46 @@ if len(models_slotn) > 0:
         axis=0,
     )
 
-if best_final_name == "expert_only":
-    pred = pred_expert
-elif best_final_name == "expert_mix":
-    pred = best_mix_w * pred_expert + (1 - best_mix_w) * pred_blend
+def _pred_for_submit_auto():
+    if best_final_name == "expert_only":
+        return pred_expert
+    if best_final_name == "expert_mix":
+        return _affine_blend(best_mix_w, pred_expert, pred_blend)
+    return pred_blend
+
+
+_submit_override = {
+    'base_blend': lambda: pred_blend,
+    's1_only': lambda: pred_s1_test,
+    'expert_only': lambda: pred_expert,
+    'expert_mix': lambda: _affine_blend(best_mix_w, pred_expert, pred_blend),
+}
+if SUBMIT_PREDICTOR == 'auto':
+    pred = _pred_for_submit_auto()
+elif SUBMIT_PREDICTOR in _submit_override:
+    pred = _submit_override[SUBMIT_PREDICTOR]()
+    print(
+        f"▶ JW_V11_SUBMIT_PREDICTOR={SUBMIT_PREDICTOR!r} → 제출만 해당 경로 "
+        f"(OOF에서 고른 head={best_final_name!r}, FINAL OOF={final_oof_mae:.6f}는 변경 없음)"
+    )
 else:
-    pred = pred_blend
+    print(f"▶ JW_V11_SUBMIT_PREDICTOR={SUBMIT_PREDICTOR!r} 미지정 값 → OOF와 동일(auto)")
+    pred = _pred_for_submit_auto()
 
-# 후처리
-pred = np.maximum(pred, CLIP_PRED_MIN)
-pred_hi = float(np.percentile(y_raw, 100 * CLIP_PRED_MAX_Q))
-pred = np.minimum(pred, pred_hi)
+# 후처리 (cupy 선택) + 제출: pandas CSV (호환)
+pred = _clip_predictions(pred, y_raw)
 
-sub = pd.DataFrame({'ID': test['ID'], TARGET: pred})
+sub = pd.DataFrame({'ID': test['ID'].values, TARGET: np.asarray(pred)})
 save_path = os.path.join(project_root, 'submission_v11_2stage.csv')
-sub.to_csv(save_path, index=False)
-print(f"▶ saved -> {save_path}")
+if CUDF is not None and USE_GPU_NUMERIC:
+    try:
+        CUDF.DataFrame({'ID': sub['ID'], TARGET: CUDF.Series(sub[TARGET].values)}).to_csv(save_path, index=False)
+        print(f"▶ saved (cudf to_csv) -> {save_path}")
+    except Exception as e:
+        print(f"▶ cudf to_csv 실패 → pandas ({e})")
+        sub.to_csv(save_path, index=False)
+        print(f"▶ saved -> {save_path}")
+else:
+    sub.to_csv(save_path, index=False)
+    print(f"▶ saved -> {save_path}")
 print(f"\n▶▶ DONE - FINAL OOF MAE: {final_oof_mae:.6f}")
