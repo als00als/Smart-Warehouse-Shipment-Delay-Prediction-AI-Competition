@@ -1,2 +1,4 @@
 data/train.csv
 SmarWareHouse.ipynb
+SmartWareHouse_실행버전.ipynb
+submission_final_top100_lgb_cat_weighted.csv
