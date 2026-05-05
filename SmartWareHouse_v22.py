@@ -1,24 +1,10 @@
 # ============================================================
-# SmartWarehouse v20
-# v19 대비 주요 변경사항:
-#   1. add_layout_cross_scenario_features(): layout_id 기준 교차 피처 추가
-#      - target을 사용하지 않으므로 전체 train 기준 계산 가능
-#      - 같은 layout_id를 가진 시나리오들의 feature 분포를 test에도 적용
-#   2. add_global_timeslot_features(): 전체 시나리오 기준 timeslot 통계 추가
-#      - timeslot별 key feature의 평균/std (cross-scenario 일반화)
-#   3. add_interaction_features(): 시나리오 평균 대비 절대 편차 피처 추가
-#      - feature_dev_from_scen = feature - feature_scen_mean
-#   4. AE 중앙값 일관성 수정:
-#      - fold별 train median → 전체 train median(global_ae_medians) 사용
-#      - train 각 fold와 test 전처리 기준이 일치함
-#   5. LGB_SEEDS: 2개 → 4개 (앙상블 다양성 향상)
-#   6. TOP_FEATURES_FOR_S2 = 300:
-#      - Stage 1 LGB feature importance 기준 상위 300개 피처만 Stage 2에 사용
-#      - Stage 2 과적합 완화
-#   7. ae_input_cols: 교차 피처 추가 전에 캡처 (AE 입력 범위 v19와 동일)
+# SmartWarehouse Hybrid Legal Scenario Features
+# - 기반: SmartWareHouse_9731.py + smart_warehouse_0501_v3.py
+# - 반영: 관리자 Q&A 기준 동일 scenario 전체 행 feature 활용 허용
+# - 보완: v3 일반화 설정 + 9731 dtype/제출 안정화 + 합법 scenario aggregate/trend/rank 복원
 # ============================================================
 
-import os
 import sys
 import time
 import warnings
@@ -32,6 +18,7 @@ import catboost as cb
 
 try:
     import optuna
+
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     OPTUNA_AVAILABLE = True
 except Exception:
@@ -47,6 +34,14 @@ import torch.nn as nn
 
 warnings.filterwarnings("ignore")
 
+# ------------------------------------------------------------
+# 규칙 검토 메모
+# - test.csv의 target은 학습에 사용하지 않는다.
+# - 동일 scenario 안의 feature 행 전체를 사용한 결측 보간/집계/rank/trend는
+#   업로드된 관리자 Q&A 기준으로 리키지로 보지 않는 범위다.
+# - 단, target encoding은 train target만 사용하고, test feature만 mapping한다.
+# ------------------------------------------------------------
+
 # 재현성 보강: numpy / torch / CUDA 결정론 설정
 np.random.seed(42)
 torch.manual_seed(42)
@@ -55,35 +50,32 @@ if torch.cuda.is_available():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 # ════════════════════════════════════════════════════════════════
 # Configuration
 # ════════════════════════════════════════════════════════════════
-
 SEED = 42
-N_FOLDS = 5
+N_FOLDS = 7
 USE_LOG_TARGET = True
 
 # ── Optuna ──
 USE_OPTUNA_HPO = True
-OPTUNA_TRIALS = 20
-OPTUNA_SAMPLE_FRAC = 0.4
+OPTUNA_TRIALS = 40
+OPTUNA_SAMPLE_FRAC = 0.5
 
 # ── Stage 2 ──
 USE_STAGE2 = True
 BLEND_ALPHA_STEP = 0.01
 CLIP_Q = 0.995
 
-# ── 2차 검증 보수화 ──
-ENABLE_TIMESLOT_ALPHA_SEARCH = False
+# ── OOF 기반 보정 옵션: train OOF만 사용, test label 미사용 ──
+ENABLE_TIMESLOT_ALPHA_SEARCH = True
 TIMESLOT_ALPHA_STEP = 0.02
 TIMESLOT_ALPHA_SMOOTH_TO_GLOBAL = 0.20
 ENABLE_GLOBAL_CALIBRATION_SEARCH = False
 
 # ── Ensemble ──
 P_GRID = [1.0, 1.5, 2.0, 3.0, 4.0]
-# v20: seed 4개로 확장 → 앙상블 다양성 향상
-LGB_SEEDS = [SEED, SEED + 100, SEED + 200, SEED + 300]
+LGB_SEEDS = [SEED, SEED + 42]
 
 # ── Feature flags ──
 USE_AUTOENCODER = True
@@ -92,73 +84,74 @@ USE_SAMPLE_WEIGHT = True
 USE_DOMAIN_CLIP = True
 USE_MISSING_MASK = True
 
-# ── Stage 2 피처 수 제한 (v20 신규) ──
-# Stage 1 LGB feature importance 기준 상위 N개 피처만 Stage 2에 사용
-TOP_FEATURES_FOR_S2 = 300
-
 # ── Sample Weight ──
 SW_HIGH_Q = 0.90
-SW_HIGH_MULT = 1.25
-SW_TS_EDGE_MULT = 1.10
+SW_HIGH_MULT = 1.10
+SW_TS_EDGE_MULT = 1.05
 
 # ── AutoEncoder ──
-AE_LATENT_DIM = 32
-AE_HIDDEN_DIM = 256
-AE_EPOCHS_MAX = 30
+AE_LATENT_DIM = 24
+AE_HIDDEN_DIM = 128
+AE_EPOCHS_MAX = 40
 AE_ES_PATIENCE = 5
 AE_BATCH_SIZE = 4096
 AE_LR = 1e-3
-AE_WEIGHT_DECAY = 3e-5
-AE_DROPOUT = 0.0
+AE_WEIGHT_DECAY = 1e-4
+AE_DROPOUT = 0.2
 AE_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ── Target Encoding ──
-TE_SMOOTHING = 20
+TE_SMOOTHING = 30
 
 # ── Domain clip keywords ──
 RATIO_KEYWORDS = ["ratio", "utilization", "efficiency", "pct", "percent", "share"]
 NONNEG_KEYWORDS = [
-    "count", "cnt", "num", "minutes", "min", "hour", "distance",
-    "delay", "inflow", "order", "robot", "battery", "density",
-    "area", "weight", "pressure", "risk", "wait", "trip",
+    "count",
+    "cnt",
+    "num",
+    "minutes",
+    "min",
+    "hour",
+    "distance",
+    "delay",
+    "inflow",
+    "order",
+    "robot",
+    "battery",
+    "density",
+    "area",
+    "weight",
+    "pressure",
+    "risk",
+    "wait",
+    "trip",
 ]
 
 TARGET = "avg_delay_minutes_next_30m"
 ID_COLS = ["ID", "layout_id", "scenario_id"]
-
 PRED_LAG_COLS = [
-    "pred_lag1", "pred_lag2", "pred_lag3",
-    "pred_diff1", "pred_diff2",
-    "pred_roll3_mean", "pred_roll5_mean",
-    "pred_ewm3", "pred_lag1_log",
-]
-
-# ── Cross-scenario feature columns (v20 신규) ──
-LAYOUT_FEAT_AGG_COLS = [
-    "congestion_score", "pack_utilization", "robot_efficiency",
-    "order_inflow_15m", "avg_trip_distance", "low_battery_ratio",
-    "outbound_truck_wait_min", "order_per_station", "robot_total",
-    "robot_active", "battery_mean",
-]
-
-GLOBAL_TS_AGG_COLS = [
-    "congestion_score", "pack_utilization", "order_inflow_15m",
-    "robot_efficiency", "avg_trip_distance", "low_battery_ratio",
-    "order_per_station",
+    "pred_lag1",
+    "pred_lag2",
+    "pred_lag3",
+    "pred_diff1",
+    "pred_diff2",
+    "pred_roll3_mean",
+    "pred_roll5_mean",
+    "pred_ewm3",
+    "pred_lag1_log",
 ]
 
 
 # ════════════════════════════════════════════════════════════════
 # Helpers
 # ════════════════════════════════════════════════════════════════
-
 def elapsed(start):
     s = int(time.time() - start)
     return f"{s // 60}m {s % 60:02d}s"
 
 
 def section(title):
-    print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
+    print(f"\n{'=' * 60}\n {title}\n{'=' * 60}")
 
 
 def to_train_target(y):
@@ -175,8 +168,12 @@ def mae(y_true, y_pred):
 
 def _powerset_models():
     return [
-        ["lgb"], ["xgb"], ["cat"],
-        ["lgb", "xgb"], ["lgb", "cat"], ["xgb", "cat"],
+        ["lgb"],
+        ["xgb"],
+        ["cat"],
+        ["lgb", "xgb"],
+        ["lgb", "cat"],
+        ["xgb", "cat"],
         ["lgb", "xgb", "cat"],
     ]
 
@@ -190,16 +187,15 @@ def ensemble_pred(oof_by, maes_by, models, p):
 def apply_scale_bias_clip(pred, scale=1.0, bias=0.0, clip_q=None):
     pred = np.asarray(pred, dtype=np.float64) * scale + bias
     pred = np.clip(pred, 0.0, None)
-
     upper = None
     if clip_q is not None:
         upper = float(np.percentile(pred, clip_q))
         pred = np.clip(pred, 0.0, upper)
-
     return pred, upper
 
 
 def search_global_calibration(oof_pred, y_true):
+    """OOF MAE 기준으로만 scale/bias/clip을 선택한다. Public LB 직접 튜닝 방지."""
     scales = np.arange(0.94, 1.061, 0.005)
     biases = np.arange(-1.0, 1.01, 0.25)
     clip_qs = [97.5, 98.0, 98.5, 99.0, 99.5, None]
@@ -213,14 +209,15 @@ def search_global_calibration(oof_pred, y_true):
             for clip_q in clip_qs:
                 pred, upper = apply_scale_bias_clip(oof_pred, scale, bias, clip_q)
                 score = mae(y_true, pred)
-                rows.append({
-                    "scale": float(scale),
-                    "bias": float(bias),
-                    "clip_q": clip_q,
-                    "clip_upper": upper,
-                    "mae": float(score),
-                })
-
+                rows.append(
+                    {
+                        "scale": float(scale),
+                        "bias": float(bias),
+                        "clip_q": clip_q,
+                        "clip_upper": upper,
+                        "mae": float(score),
+                    }
+                )
                 if score < best_score:
                     best_score = float(score)
                     best_params = {
@@ -236,9 +233,11 @@ def search_global_calibration(oof_pred, y_true):
 
 def encode_remaining_objects(train_df, test_df, exclude=tuple(ID_COLS)):
     """
-    공통 object 컬럼은 train 기준 mapping으로만 test를 변환한다.
-    test-only category는 -1로 처리한다.
-    train/test 결합 factorize를 사용하지 않는다.
+    2차 검증 보수화:
+    - train/test 결합 factorize를 사용하지 않는다.
+    - ID, layout_id, scenario_id는 식별자/group key로 유지한다.
+    - 공통 object 컬럼은 train 기준 mapping으로만 test를 변환한다.
+    - test-only category는 -1로 처리한다.
     """
     common = train_df.columns.intersection(test_df.columns)
 
@@ -253,10 +252,11 @@ def encode_remaining_objects(train_df, test_df, exclude=tuple(ID_COLS)):
             tr_values = train_df[c].astype(str).fillna("missing")
             codes, uniques = pd.factorize(tr_values)
             train_df[c] = codes.astype(np.int32)
-
             mapping = {v: i for i, v in enumerate(uniques)}
             test_df[c] = (
-                test_df[c].astype(str).fillna("missing")
+                test_df[c]
+                .astype(str)
+                .fillna("missing")
                 .map(mapping)
                 .fillna(-1)
                 .astype(np.int32)
@@ -266,13 +266,17 @@ def encode_remaining_objects(train_df, test_df, exclude=tuple(ID_COLS)):
         if c in exclude or c == TARGET:
             continue
         if not pd.api.types.is_numeric_dtype(train_df[c]):
-            train_df[c] = pd.factorize(train_df[c].astype(str).fillna("missing"))[0].astype(np.int32)
+            train_df[c] = pd.factorize(train_df[c].astype(str).fillna("missing"))[0].astype(
+                np.int32
+            )
 
     for c in test_df.columns:
         if c in exclude:
             continue
         if not pd.api.types.is_numeric_dtype(test_df[c]):
-            test_df[c] = pd.factorize(test_df[c].astype(str).fillna("missing"))[0].astype(np.int32)
+            test_df[c] = pd.factorize(test_df[c].astype(str).fillna("missing"))[0].astype(
+                np.int32
+            )
 
     return train_df, test_df
 
@@ -302,7 +306,6 @@ def build_sample_weight(df):
 # ════════════════════════════════════════════════════════════════
 # AutoEncoder
 # ════════════════════════════════════════════════════════════════
-
 class TabularAutoEncoder(nn.Module):
     def __init__(self, n_in, hidden, latent, dropout=0.0):
         super().__init__()
@@ -310,10 +313,16 @@ class TabularAutoEncoder(nn.Module):
             nn.Linear(n_in, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden, latent),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden // 2, latent),
         )
         self.dec = nn.Sequential(
-            nn.Linear(latent, hidden),
+            nn.Linear(latent, hidden // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden // 2, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
             nn.Linear(hidden, n_in),
@@ -326,19 +335,16 @@ class TabularAutoEncoder(nn.Module):
 
 def ae_prepare_matrix(df, cols, medians):
     X = df[cols].to_numpy(dtype=np.float64)
-
     for j, col in enumerate(cols):
         m = float(medians[col])
         v = X[:, j]
         v[~np.isfinite(v)] = m
         v[np.isnan(v)] = m
-
     return X
 
 
 def ae_train_fold(X_tr, X_va, device, seed):
     torch.manual_seed(seed)
-
     n_in = X_tr.shape[1]
     model = TabularAutoEncoder(n_in, AE_HIDDEN_DIM, AE_LATENT_DIM, AE_DROPOUT).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=AE_LR, weight_decay=AE_WEIGHT_DECAY)
@@ -354,7 +360,7 @@ def ae_train_fold(X_tr, X_va, device, seed):
         perm = torch.randperm(tr_t.shape[0], device=device)
 
         for i in range(0, len(perm), AE_BATCH_SIZE):
-            xb = tr_t[perm[i: i + AE_BATCH_SIZE]]
+            xb = tr_t[perm[i : i + AE_BATCH_SIZE]]
             opt.zero_grad(set_to_none=True)
             xh, _ = model(xb)
             nn.functional.mse_loss(xh, xb).backward()
@@ -370,8 +376,9 @@ def ae_train_fold(X_tr, X_va, device, seed):
             no_improve = 0
         else:
             no_improve += 1
-            if no_improve >= AE_ES_PATIENCE:
-                break
+
+        if no_improve >= AE_ES_PATIENCE:
+            break
 
     if best_state:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
@@ -394,7 +401,7 @@ def ae_encode(X_scaled, state_dict, device):
 
     with torch.no_grad():
         for i in range(0, len(xt), AE_BATCH_SIZE):
-            out.append(model(xt[i: i + AE_BATCH_SIZE])[1].cpu().numpy())
+            out.append(model(xt[i : i + AE_BATCH_SIZE])[1].cpu().numpy())
 
     return np.vstack(out)
 
@@ -402,25 +409,66 @@ def ae_encode(X_scaled, state_dict, device):
 # ════════════════════════════════════════════════════════════════
 # Feature Engineering
 # ════════════════════════════════════════════════════════════════
-
 SCENARIO_AGG_COLS = [
-    "congestion_score", "order_inflow_15m", "battery_mean", "pack_utilization",
-    "avg_trip_distance", "low_battery_ratio", "max_zone_density", "sku_concentration",
-    "robot_idle", "outbound_truck_wait_min", "order_per_station", "robot_efficiency",
-    "order_pressure", "risk_index", "battery_risk", "battery_cv",
-    "zone_dispersion", "avg_items_per_order", "cold_chain_ratio",
-    "manual_override_ratio", "robot_total", "battery_std",
-    "bottle_neck", "trip_congestion", "pack_order_ratio", "robot_per_station",
+    "congestion_score",
+    "order_inflow_15m",
+    "battery_mean",
+    "pack_utilization",
+    "avg_trip_distance",
+    "low_battery_ratio",
+    "max_zone_density",
+    "sku_concentration",
+    "robot_idle",
+    "outbound_truck_wait_min",
+    "order_per_station",
+    "robot_efficiency",
+    "order_pressure",
+    "risk_index",
+    "battery_risk",
+    "battery_cv",
+    "zone_dispersion",
+    "avg_items_per_order",
+    "cold_chain_ratio",
+    "manual_override_ratio",
+    "robot_total",
+    "battery_std",
+    "bottle_neck",
+    "trip_congestion",
+    "pack_order_ratio",
+    "robot_per_station",
+    "trip_per_robot",
+]
+
+SCENARIO_TREND_COLS = [
+    "congestion_score",
+    "order_inflow_15m",
+    "pack_utilization",
+    "low_battery_ratio",
 ]
 
 TS_COLS = [
-    "order_inflow_15m", "robot_active", "robot_total",
-    "pack_utilization", "congestion_score", "avg_trip_distance",
-    "low_battery_ratio", "outbound_truck_wait_min",
-    "order_per_station", "robot_efficiency",
+    "order_inflow_15m",
+    "robot_active",
+    "robot_total",
+    "pack_utilization",
+    "congestion_score",
+    "avg_trip_distance",
+    "low_battery_ratio",
+    "outbound_truck_wait_min",
+    "order_per_station",
+    "robot_efficiency",
+    "risk_index",
+    "bottle_neck",
+    "order_pressure",
 ]
 
-EWM_CORE_COLS = ["order_inflow_15m", "congestion_score", "pack_utilization"]
+EWM_CORE_COLS = [
+    "order_inflow_15m",
+    "congestion_score",
+    "pack_utilization",
+    "risk_index",
+    "order_per_station",
+]
 ROLL_WINDOWS = (3, 5, 10)
 
 
@@ -432,26 +480,29 @@ def add_missing_indicators(df):
 
 
 def handle_missing(df):
-    # 대회 Q&A 기준:
-    # test.csv 제공 시 같은 scenario_id의 25개 타임슬롯은 모두 관측 완료된 입력으로 간주된다.
-    # 따라서 같은 시나리오 내부의 ffill/bfill 보간은 대회 기준 leakage로 보지 않는다.
     cols = [c for c in df.columns if df[c].isnull().any() and c not in ID_COLS + [TARGET]]
-
     if cols:
         df[cols] = df.groupby("scenario_id")[cols].ffill()
         df[cols] = df.groupby("scenario_id")[cols].bfill()
         df[cols] = df[cols].fillna(df[cols].median())
-
     return df
 
 
 def clip_domain(df):
+    SIGNED_TREND_SUFFIXES = (
+        "_scen_delta",
+        "_rel_to_first",
+        "_rel_to_last",
+    )
+
     for c in df.columns:
         if c in ID_COLS + [TARGET] or not pd.api.types.is_numeric_dtype(df[c]):
             continue
 
-        lc = c.lower()
+        if c.endswith(SIGNED_TREND_SUFFIXES):
+            continue
 
+        lc = c.lower()
         if any(k in lc for k in RATIO_KEYWORDS):
             df[c] = df[c].clip(0.0, 1.0)
         elif any(k in lc for k in NONNEG_KEYWORDS):
@@ -486,6 +537,12 @@ def add_basic_features(df):
     if "pack_utilization" in df.columns:
         df["pack_order_ratio"] = df["pack_utilization"] / (df["order_per_station"] + 1e-6)
 
+    # 같은 scenario 내부에서 이전 시점 대비 변화량을 반영한다.
+    if "order_inflow_15m" in df.columns:
+        df["order_accel"] = df.groupby("scenario_id")["order_inflow_15m"].diff().fillna(0.0)
+    if "congestion_score" in df.columns:
+        df["congestion_accel"] = df.groupby("scenario_id")["congestion_score"].diff().fillna(0.0)
+
     return df
 
 
@@ -508,7 +565,9 @@ def add_timeseries_features(df):
         for w in ROLL_WINDOWS:
             roll = s1.groupby(scen).rolling(window=w, min_periods=1)
             df[f"{col}_roll{w}_mean"] = roll.mean().reset_index(level=0, drop=True)
-            df[f"{col}_roll{w}_std"] = roll.std().reset_index(level=0, drop=True).fillna(0.0)
+            df[f"{col}_roll{w}_std"] = (
+                roll.std().reset_index(level=0, drop=True).fillna(0.0)
+            )
 
         if col in EWM_CORE_COLS:
             df[f"{col}_ewm_mean"] = (
@@ -522,12 +581,10 @@ def add_timeseries_features(df):
 
     if lag_cols:
         df[lag_cols] = df.groupby("scenario_id")[lag_cols].ffill()
-
         for c in lag_cols:
             base = c.split("_lag")[0].split("_diff")[0]
             if base in df.columns:
                 df[c] = df[c].fillna(df.groupby("scenario_id")[base].transform("mean"))
-
         df[lag_cols] = df[lag_cols].fillna(df[lag_cols].median())
 
     return df
@@ -539,6 +596,7 @@ def add_interaction_features(df):
         ("congestion_score", "avg_trip_distance", "cong_x_trip"),
         ("order_per_station", "congestion_score", "ops_x_cong"),
         ("order_per_station", "pack_utilization", "ops_x_pack"),
+        ("risk_index", "pack_utilization", "risk_x_pack"),
     ]
 
     for a, b, name in pairs:
@@ -553,15 +611,14 @@ def add_interaction_features(df):
             if col in df.columns:
                 df[f"ts_x_{col}"] = df["timeslot"] * df[col]
 
-    # 대회 Q&A 기준:
-    # 같은 scenario_id의 25개 타임슬롯 전체 feature 참조는 허용되는 입력 내부 가공으로 해석한다.
     present = [c for c in SCENARIO_AGG_COLS if c in df.columns]
-
     if present:
         stats = df.groupby("scenario_id")[present].agg(["mean", "max", "min", "std"])
         stats.columns = [f"{c}_scen_{s}" for c, s in stats.columns]
         stats = stats.reset_index()
         df = df.merge(stats, on="scenario_id", how="left")
+
+    df = add_scenario_trend_features(df)
 
     scen_pairs = [
         ("congestion_score_scen_mean", "pack_utilization_scen_mean", "cong_pack_interaction"),
@@ -576,21 +633,14 @@ def add_interaction_features(df):
             df[name] = df[a] * df[b]
 
     if "low_battery_ratio_scen_mean" in df.columns and "robot_efficiency_scen_mean" in df.columns:
-        df["battery_efficiency_risk"] = (
-            df["low_battery_ratio_scen_mean"] * (1 - df["robot_efficiency_scen_mean"])
+        df["battery_efficiency_risk"] = df["low_battery_ratio_scen_mean"] * (
+            1 - df["robot_efficiency_scen_mean"]
         )
 
-    for col in ["congestion_score", "order_per_station", "pack_utilization", "avg_trip_distance"]:
+    for col in ["congestion_score", "order_per_station", "pack_utilization", "avg_trip_distance", "risk_index"]:
         sm = f"{col}_scen_mean"
         if col in df.columns and sm in df.columns:
             df[f"{col}_rel_to_scen"] = df[col] / (df[sm] + 1e-6)
-
-    # v20 신규: 시나리오 평균 대비 절대 편차 피처
-    # rel_to_scen은 비율이지만, 절대 편차는 다른 정보를 제공한다
-    for col in ["congestion_score", "pack_utilization", "order_per_station", "avg_trip_distance"]:
-        sm = f"{col}_scen_mean"
-        if col in df.columns and sm in df.columns:
-            df[f"{col}_dev_from_scen"] = df[col] - df[sm]
 
     for col in ["congestion_score", "order_per_station", "pack_utilization"]:
         if col in df.columns:
@@ -599,17 +649,40 @@ def add_interaction_features(df):
     return df
 
 
+def add_scenario_trend_features(df):
+    present = [c for c in SCENARIO_TREND_COLS if c in df.columns]
+    if not present:
+        return df
+
+    for col in present:
+        g = df.groupby("scenario_id")[col]
+        first = g.transform("first")
+        last = g.transform("last")
+        mx = g.transform("max")
+        mn = g.transform("min")
+
+        df[f"{col}_scen_delta"] = last - first
+        df[f"{col}_scen_range"] = mx - mn
+        df[f"{col}_rel_to_first"] = df[col] - first
+        df[f"{col}_rel_to_last"] = df[col] - last
+
+    return df
+
+
 def add_extra_features(df):
     gsz = df.groupby("scenario_id")["scenario_id"].transform("size")
     gpos = df.groupby("scenario_id").cumcount()
-
     df["row_frac_in_scen"] = (gpos + 1) / (gsz + 1e-6)
 
     if "order_inflow_15m" in df.columns:
-        df["sqrt_order_inflow"] = np.sqrt(np.maximum(df["order_inflow_15m"].astype(np.float64), 0.0))
+        df["sqrt_order_inflow"] = np.sqrt(
+            np.maximum(df["order_inflow_15m"].astype(np.float64), 0.0)
+        )
 
     if "robot_total" in df.columns:
-        df["sqrt_robot_total"] = np.sqrt(np.maximum(df["robot_total"].astype(np.float64), 0.0))
+        df["sqrt_robot_total"] = np.sqrt(
+            np.maximum(df["robot_total"].astype(np.float64), 0.0)
+        )
 
     if "timeslot" in df.columns:
         ang = 2 * np.pi * df["timeslot"].astype(np.float64) / 24.0
@@ -639,76 +712,10 @@ def preprocess_all(df, layout_df):
 
 
 # ════════════════════════════════════════════════════════════════
-# Cross-scenario features (v20 신규)
+# Pred-lag features, Stage 2용
 # ════════════════════════════════════════════════════════════════
-
-def add_layout_cross_scenario_features(train_df, test_df):
-    """
-    layout_id 기준 교차 시나리오 피처를 추가한다.
-
-    - target을 사용하지 않으므로 전체 train 기준 통계 계산이 허용된다.
-    - 같은 layout_id를 가진 모든 훈련 시나리오들의 feature 분포를 요약한다.
-    - test의 layout_id가 train에 존재하면 동일한 통계를 적용한다.
-    - 이 피처들은 창고 레이아웃 유형별 운영 특성을 포착하여 일반화를 돕는다.
-    """
-    cols = [c for c in LAYOUT_FEAT_AGG_COLS if c in train_df.columns]
-
-    if not cols:
-        return train_df, test_df
-
-    layout_stats = train_df.groupby("layout_id")[cols].agg(["mean", "std"])
-    layout_stats.columns = [f"layout_{c}_{s}" for c, s in layout_stats.columns]
-    layout_stats = layout_stats.reset_index()
-
-    # 해당 layout_id가 학습 데이터에 몇 개의 시나리오를 가지는지
-    layout_scen_cnt = (
-        train_df.groupby("layout_id")["scenario_id"].nunique()
-        .reset_index(name="layout_scenario_cnt")
-    )
-    layout_stats = layout_stats.merge(layout_scen_cnt, on="layout_id", how="left")
-
-    train_df = train_df.merge(layout_stats, on="layout_id", how="left")
-    test_df = test_df.merge(layout_stats, on="layout_id", how="left")
-
-    print(f"  layout 교차 피처 추가: {len(layout_stats.columns) - 1}개")
-    return train_df, test_df
-
-
-def add_global_timeslot_features(train_df, test_df):
-    """
-    전체 훈련 시나리오 기준 timeslot별 통계 피처를 추가한다.
-
-    - target을 사용하지 않으므로 전체 train 기준 통계 계산이 허용된다.
-    - 각 timeslot(0~24)에서의 전형적인 운영 상태를 포착한다.
-    - 예: timeslot=10에서의 전형적 혼잡도, 주문량 등
-    - test도 timeslot이 계산되어 있으므로 동일하게 적용 가능하다.
-    """
-    if "timeslot" not in train_df.columns:
-        return train_df, test_df
-
-    cols = [c for c in GLOBAL_TS_AGG_COLS if c in train_df.columns]
-
-    if not cols:
-        return train_df, test_df
-
-    ts_stats = train_df.groupby("timeslot")[cols].agg(["mean", "std"])
-    ts_stats.columns = [f"global_ts_{c}_{s}" for c, s in ts_stats.columns]
-    ts_stats = ts_stats.reset_index()
-
-    train_df = train_df.merge(ts_stats, on="timeslot", how="left")
-    test_df = test_df.merge(ts_stats, on="timeslot", how="left")
-
-    print(f"  global timeslot 통계 피처 추가: {len(ts_stats.columns) - 1}개")
-    return train_df, test_df
-
-
-# ════════════════════════════════════════════════════════════════
-# Pred-lag features (Stage 2용)
-# ════════════════════════════════════════════════════════════════
-
 def add_pred_lag_features(df, pred_vec, gm):
     df = df.sort_values(["scenario_id", "ID"]).reset_index(drop=True)
-
     p = np.asarray(pred_vec, dtype=np.float64)
     df["_pred"] = p
 
@@ -723,9 +730,18 @@ def add_pred_lag_features(df, pred_vec, gm):
     df["pred_roll3_mean"] = g.transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
     df["pred_roll5_mean"] = g.transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
     df["pred_ewm3"] = g.transform(lambda x: x.shift(1).ewm(alpha=0.3, adjust=False).mean())
-    df["pred_lag1_log"] = np.log1p(np.maximum(df["pred_lag1"].fillna(gm).astype(np.float64), 0.0))
+    df["pred_lag1_log"] = np.log1p(
+        np.maximum(df["pred_lag1"].fillna(gm).astype(np.float64), 0.0)
+    )
 
-    for c in ["pred_lag1", "pred_lag2", "pred_lag3", "pred_roll3_mean", "pred_roll5_mean", "pred_ewm3"]:
+    for c in [
+        "pred_lag1",
+        "pred_lag2",
+        "pred_lag3",
+        "pred_roll3_mean",
+        "pred_roll5_mean",
+        "pred_ewm3",
+    ]:
         df[c] = df[c].fillna(gm)
 
     df.drop(columns=["_pred"], inplace=True)
@@ -735,23 +751,21 @@ def add_pred_lag_features(df, pred_vec, gm):
 # ════════════════════════════════════════════════════════════════
 # Target Encoding
 # ════════════════════════════════════════════════════════════════
-
 def apply_target_encoding(train_df, test_df, kf, groups, global_mean):
     te_cols = [c for c in ["layout_id", "timeslot", "layout_type"] if c in train_df.columns]
-    te_pairs = [(a, b) for i, a in enumerate(te_cols) for b in te_cols[i + 1:]]
+    te_pairs = [(a, b) for i, a in enumerate(te_cols) for b in te_cols[i + 1 :]]
 
     def _te(col_name, tr_key, te_key):
         te_col = f"{col_name}_te"
         train_df[te_col] = np.nan
 
         for tr_idx, va_idx in kf.split(train_df, train_df[TARGET], groups=groups):
-            tr = train_df.iloc[tr_idx]
-            st = tr.groupby(tr_key.iloc[tr_idx])[TARGET].agg(["mean", "count"])
+            st = train_df.iloc[tr_idx].groupby(tr_key.iloc[tr_idx])[TARGET].agg(["mean", "count"])
             smooth = (st["count"] * st["mean"] + TE_SMOOTHING * global_mean) / (
                 st["count"] + TE_SMOOTHING
             )
-            train_df.loc[train_df.index[va_idx], te_col] = (
-                tr_key.iloc[va_idx].map(smooth).fillna(global_mean)
+            train_df.loc[train_df.index[va_idx], te_col] = tr_key.iloc[va_idx].map(smooth).fillna(
+                global_mean
             )
 
         st_full = train_df.groupby(tr_key)[TARGET].agg(["mean", "count"])
@@ -775,32 +789,29 @@ def apply_target_encoding(train_df, test_df, kf, groups, global_mean):
 # ════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════
-
 def main():
     T0 = time.time()
 
     # ── 0. Environment ──
     section("개발 환경 및 라이브러리 버전")
-    print(f"  Python    : {sys.version}")
-    print(f"  pandas    : {pd.__version__}")
-    print(f"  numpy     : {np.__version__}")
-    print(f"  lightgbm  : {lgb.__version__}")
-    print(f"  xgboost   : {xgb.__version__}")
-    print(f"  catboost  : {cb.__version__}")
-    print(f"  torch     : {torch.__version__}")
-    print(f"  optuna    : {optuna.__version__ if OPTUNA_AVAILABLE else '미설치 - 기본 파라미터 사용'}")
+    print(f" Python   : {sys.version}")
+    print(f" pandas   : {pd.__version__}")
+    print(f" numpy    : {np.__version__}")
+    print(f" lightgbm : {lgb.__version__}")
+    print(f" xgboost  : {xgb.__version__}")
+    print(f" catboost : {cb.__version__}")
+    print(f" torch    : {torch.__version__}")
+    print(f" optuna   : {optuna.__version__ if OPTUNA_AVAILABLE else '미설치 - 기본 파라미터 사용'}")
 
     # ── 1. Data Load ──
     section("데이터 로드")
-
     data_dir = Path("data")
     project_root = Path(".")
 
     if not (data_dir / "train.csv").is_file():
         raise FileNotFoundError("./data/train.csv가 없습니다. 코드와 같은 위치에 data/ 폴더를 배치하세요.")
 
-    print(f"  data: {data_dir}")
-
+    print(f" data: {data_dir}")
     t0 = time.time()
 
     train = pd.read_csv(data_dir / "train.csv")
@@ -815,58 +826,35 @@ def main():
 
     if "ID" not in sample_submission.columns or TARGET not in sample_submission.columns:
         raise ValueError("sample_submission.csv는 ID와 target 컬럼을 포함해야 합니다.")
-
     if not sample_submission["ID"].is_unique:
         raise ValueError("sample_submission.csv의 ID가 중복되어 있습니다.")
-
     if set(sample_submission["ID"]) != set(test["ID"]):
         raise ValueError("sample_submission.csv의 ID 목록이 test.csv와 일치하지 않습니다.")
 
-    print(f"  train {len(train):,} / test {len(test):,}  ({elapsed(t0)})")
+    print(f" train {len(train):,} / test {len(test):,} ({elapsed(t0)})")
 
     # ── 2. Preprocessing ──
     section("전처리")
-
     t0 = time.time()
-
     train = preprocess_all(train, layout)
     test = preprocess_all(test, layout)
-
     train, test = encode_remaining_objects(train, test, exclude=tuple(ID_COLS))
-
-    # v20: AE 입력 컬럼은 교차 피처 추가 전에 확정한다.
-    # 교차 피처(layout/timeslot 통계)는 AE에 넣지 않고 직접 tree model에 공급한다.
-    # 이렇게 하면 v19와 AE 입력 범위가 동일하여 비교가 용이하다.
-    ae_input_cols = [
-        c for c in train.columns
-        if c not in ID_COLS + [TARGET]
-        and pd.api.types.is_numeric_dtype(train[c])
-    ]
-
-    # v20: layout 교차 피처 및 global timeslot 통계 피처 추가
-    section("교차 피처 추가 (v20 신규)")
-    train, test = add_layout_cross_scenario_features(train, test)
-    train, test = add_global_timeslot_features(train, test)
-
-    print(f"  전처리 + 교차 피처 완료 ({elapsed(t0)})")
+    print(f" 완료 ({elapsed(t0)})")
 
     # ── 3. Target Encoding ──
     if USE_TARGET_ENCODING:
         section("Target Encoding")
-
         t0 = time.time()
         global_mean = float(train[TARGET].mean())
         kf_te = GroupKFold(n_splits=N_FOLDS)
-
         apply_target_encoding(train, test, kf_te, train["scenario_id"], global_mean)
-
-        print(f"  완료 ({elapsed(t0)})")
+        print(f" 완료 ({elapsed(t0)})")
     else:
         global_mean = float(train[TARGET].mean())
 
     # ── 4. Feature columns ──
     feature_cols_s1_base = [c for c in train.columns if c not in ID_COLS + [TARGET]]
-
+    ae_input_cols = [c for c in feature_cols_s1_base if pd.api.types.is_numeric_dtype(train[c])]
     AE_COLS = [f"ae_z{i}" for i in range(AE_LATENT_DIM)] if USE_AUTOENCODER else []
 
     if USE_AUTOENCODER:
@@ -879,8 +867,7 @@ def main():
 
     assert_numeric_features(train, feature_cols_s1_base, "train stage1 base")
     assert_numeric_features(test, feature_cols_s1_base, "test stage1 base")
-
-    print(f"  피처 수: {len(feature_cols_s1)} (base={len(feature_cols_s1_base)}, AE={len(AE_COLS)})")
+    print(f" 피처 수: {len(feature_cols_s1)} (base={len(feature_cols_s1_base)}, AE={len(AE_COLS)})")
 
     # ── 5. CV Setup ──
     y_all = to_train_target(train[TARGET].values)
@@ -889,7 +876,6 @@ def main():
     sw_all = build_sample_weight(train)
 
     _scen_mean = train.groupby("scenario_id")[TARGET].transform("mean")
-
     try:
         y_strat = pd.qcut(_scen_mean, q=10, labels=False, duplicates="drop")
         y_strat = pd.Series(y_strat).fillna(0).astype(np.int64).values
@@ -899,16 +885,15 @@ def main():
     try:
         kf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
         _ = list(kf.split(train, y_strat, groups=groups))
-        print(f"  CV: StratifiedGroupKFold ({N_FOLDS}-fold)")
+        print(f" CV: StratifiedGroupKFold ({N_FOLDS}-fold)")
     except Exception:
         kf = GroupKFold(n_splits=N_FOLDS)
         y_strat = y_all
-        print(f"  CV: GroupKFold ({N_FOLDS}-fold)")
+        print(f" CV: GroupKFold ({N_FOLDS}-fold)")
 
     # ── 6. Optuna HPO ──
     if USE_OPTUNA_HPO and OPTUNA_AVAILABLE:
         section(f"Optuna LightGBM 최적화 ({OPTUNA_TRIALS} trials)")
-
         rng = np.random.default_rng(SEED)
         sample_scens = train["scenario_id"].unique()
         sample_scens = rng.choice(
@@ -916,37 +901,41 @@ def main():
             size=int(len(sample_scens) * OPTUNA_SAMPLE_FRAC),
             replace=False,
         )
-
         sample_mask = train["scenario_id"].isin(sample_scens)
         train_sample = train[sample_mask].reset_index(drop=True)
         y_sample = to_train_target(train_sample[TARGET])
 
         sample_kf = GroupKFold(n_splits=3)
-        sample_folds = list(sample_kf.split(train_sample, y_sample, groups=train_sample["scenario_id"]))
+        sample_folds = list(
+            sample_kf.split(train_sample, y_sample, groups=train_sample["scenario_id"])
+        )
 
         def lgb_objective(trial):
             params = dict(
                 objective="regression_l1",
                 n_estimators=2000,
-                learning_rate=trial.suggest_float("learning_rate", 0.005, 0.03, log=True),
-                max_depth=trial.suggest_int("max_depth", 5, 12),
-                num_leaves=trial.suggest_int("num_leaves", 63, 2047),
-                min_child_samples=trial.suggest_int("min_child_samples", 20, 100),
+                learning_rate=trial.suggest_float("learning_rate", 0.005, 0.04, log=True),
+                max_depth=trial.suggest_int("max_depth", 4, 10),
+                num_leaves=trial.suggest_int("num_leaves", 31, 1023),
+                min_child_samples=trial.suggest_int("min_child_samples", 50, 200),
                 subsample=trial.suggest_float("subsample", 0.6, 0.9),
                 subsample_freq=1,
-                colsample_bytree=trial.suggest_float("colsample_bytree", 0.3, 0.8),
-                reg_alpha=trial.suggest_float("reg_alpha", 0.0, 1.0),
-                reg_lambda=trial.suggest_float("reg_lambda", 0.5, 10.0),
+                colsample_bytree=trial.suggest_float("colsample_bytree", 0.4, 0.8),
+                reg_alpha=trial.suggest_float("reg_alpha", 0.1, 3.0),
+                reg_lambda=trial.suggest_float("reg_lambda", 1.0, 20.0),
+                min_split_gain=trial.suggest_float("min_split_gain", 0.0, 1.0),
+                path_smooth=trial.suggest_float("path_smooth", 0.0, 1.0),
                 random_state=SEED,
                 verbose=-1,
             )
 
             fold_maes = []
-
             for tr_idx, val_idx in sample_folds:
                 X_tr = train_sample.iloc[tr_idx][feature_cols_s1_base].replace([np.inf, -np.inf], np.nan)
                 y_tr = y_sample.iloc[tr_idx]
-                X_val = train_sample.iloc[val_idx][feature_cols_s1_base].replace([np.inf, -np.inf], np.nan)
+                X_val = train_sample.iloc[val_idx][feature_cols_s1_base].replace(
+                    [np.inf, -np.inf], np.nan
+                )
                 y_val_raw = train_sample.iloc[val_idx][TARGET]
 
                 m = lgb.LGBMRegressor(**params)
@@ -960,13 +949,11 @@ def main():
                         lgb.log_evaluation(-1),
                     ],
                 )
-
                 fold_maes.append(mae(y_val_raw, from_train_pred(m.predict(X_val))))
 
             return float(np.mean(fold_maes))
 
         optuna_start = time.time()
-
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(seed=SEED),
@@ -974,31 +961,31 @@ def main():
 
         def optuna_cb(study, trial):
             print(
-                f"  trial {trial.number + 1:>2}/{OPTUNA_TRIALS}"
-                f"  MAE {trial.value:.4f}  best {study.best_value:.4f}"
-                f"  {elapsed(optuna_start)}",
+                f" trial {trial.number + 1:>2}/{OPTUNA_TRIALS}"
+                f" MAE {trial.value:.4f} best {study.best_value:.4f}"
+                f" {elapsed(optuna_start)}",
                 flush=True,
             )
 
         study.optimize(lgb_objective, n_trials=OPTUNA_TRIALS, callbacks=[optuna_cb])
-
         best_hp = study.best_params
-
-        print(f"\n  최적 파라미터: {best_hp}")
-        print(f"  Optuna 소요: {elapsed(optuna_start)}")
+        print(f"\n 최적 파라미터: {best_hp}")
+        print(f" Optuna 소요: {elapsed(optuna_start)}")
     else:
         if USE_OPTUNA_HPO and not OPTUNA_AVAILABLE:
-            print("  Optuna가 설치되어 있지 않아 기본 LGB 파라미터를 사용합니다.")
+            print(" Optuna가 설치되어 있지 않아 기본 LGB 파라미터를 사용합니다.")
 
         best_hp = dict(
             learning_rate=0.01,
-            max_depth=-1,
-            num_leaves=2047,
-            min_child_samples=60,
+            max_depth=7,
+            num_leaves=511,
+            min_child_samples=100,
             subsample=0.75,
             colsample_bytree=0.5,
-            reg_alpha=0.3,
-            reg_lambda=5.0,
+            reg_alpha=0.5,
+            reg_lambda=8.0,
+            min_split_gain=0.0,
+            path_smooth=0.0,
         )
 
     # ── 7. Stage 1 Model Parameters ──
@@ -1006,14 +993,16 @@ def main():
         objective="regression_l1",
         n_estimators=25000,
         learning_rate=best_hp.get("learning_rate", 0.01),
-        max_depth=best_hp.get("max_depth", -1),
-        num_leaves=best_hp.get("num_leaves", 2047),
-        min_child_samples=best_hp.get("min_child_samples", 60),
+        max_depth=best_hp.get("max_depth", 7),
+        num_leaves=best_hp.get("num_leaves", 511),
+        min_child_samples=best_hp.get("min_child_samples", 100),
+        min_split_gain=best_hp.get("min_split_gain", 0.0),
+        path_smooth=best_hp.get("path_smooth", 0.0),
         subsample=best_hp.get("subsample", 0.75),
         subsample_freq=1,
         colsample_bytree=best_hp.get("colsample_bytree", 0.5),
-        reg_alpha=best_hp.get("reg_alpha", 0.3),
-        reg_lambda=best_hp.get("reg_lambda", 5.0),
+        reg_alpha=best_hp.get("reg_alpha", 0.5),
+        reg_lambda=best_hp.get("reg_lambda", 8.0),
         random_state=SEED,
         verbose=-1,
     )
@@ -1021,25 +1010,27 @@ def main():
     xgb_params = dict(
         objective="reg:absoluteerror",
         n_estimators=20000,
-        learning_rate=min(best_hp.get("learning_rate", 0.015) * 1.2, 0.03),
-        max_depth=min(best_hp.get("max_depth", 10), 10),
+        learning_rate=min(best_hp.get("learning_rate", 0.015) * 1.2, 0.04),
+        max_depth=min(best_hp.get("max_depth", 7), 8),
+        min_child_weight=max(best_hp.get("min_child_samples", 100) // 10, 5),
         subsample=best_hp.get("subsample", 0.75),
         colsample_bytree=best_hp.get("colsample_bytree", 0.5),
         colsample_bynode=0.5,
-        reg_alpha=best_hp.get("reg_alpha", 0.3),
-        reg_lambda=max(best_hp.get("reg_lambda", 3.0), 2.0),
+        reg_alpha=max(best_hp.get("reg_alpha", 0.5), 0.3),
+        reg_lambda=max(best_hp.get("reg_lambda", 8.0), 5.0),
         random_state=SEED,
         tree_method="hist",
         eval_metric="mae",
-        early_stopping_rounds=500,
+        early_stopping_rounds=400,
         verbosity=0,
     )
 
     cat_params = dict(
         iterations=20000,
-        learning_rate=min(best_hp.get("learning_rate", 0.015) * 1.2, 0.03),
-        depth=min(best_hp.get("max_depth", 10), 10),
-        l2_leaf_reg=5.0,
+        learning_rate=min(best_hp.get("learning_rate", 0.015) * 1.2, 0.04),
+        depth=min(best_hp.get("max_depth", 7), 8),
+        l2_leaf_reg=max(best_hp.get("reg_lambda", 8.0), 5.0),
+        min_data_in_leaf=best_hp.get("min_child_samples", 100),
         bootstrap_type="MVS",
         subsample=best_hp.get("subsample", 0.75),
         colsample_bylevel=best_hp.get("colsample_bytree", 0.5),
@@ -1047,12 +1038,11 @@ def main():
         eval_metric="MAE",
         random_seed=SEED,
         task_type="CPU",
-        early_stopping_rounds=500,
+        early_stopping_rounds=400,
     )
 
     # ── 8. Stage 1 Training ──
-    section(f"Stage 1 학습 (LGB x{len(LGB_SEEDS)} seeds + XGB + CAT)")
-
+    section(f"Stage 1 학습 (LGB x{len(LGB_SEEDS)} seeds + XGB + CAT, AE latent={AE_LATENT_DIM})")
     t0 = time.time()
 
     oof_s1_lgb = np.zeros(len(train))
@@ -1062,48 +1052,31 @@ def main():
     models_s1_lgb, models_s1_xgb, models_s1_cat = [], [], []
     ae_fold_artifacts = []
 
-    # v20: AE 입력을 위한 global median을 fold loop 이전에 한 번만 계산한다.
-    # v19에서는 각 fold의 train split median을 사용했으나, test encoding 시
-    # 전체 train median(med_te)을 사용하는 것과 불일치가 있었다.
-    # v20에서는 전체 train median을 train/test 모두에 통일 적용한다.
-    if USE_AUTOENCODER:
-        global_ae_medians = train[ae_input_cols].median()
-        print(f"  AE global median 계산 완료 (컬럼 수: {len(ae_input_cols)})")
-
-    # Stage 1 LGB 피처 중요도 누적용
-    lgb_importance_sum = np.zeros(len(feature_cols_s1))
-
     for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_strat, groups=groups), 1):
-        print(f"\n  ── Fold {fold}/{N_FOLDS} ──")
-
+        print(f"\n ── Fold {fold}/{N_FOLDS} ──")
         tr_df = train.iloc[tr_idx].copy()
         va_df = train.iloc[va_idx].copy()
 
         if USE_AUTOENCODER:
-            # v20: fold별 median 대신 global_ae_medians 사용
-            X_ae_tr = ae_prepare_matrix(tr_df, ae_input_cols, global_ae_medians)
-            X_ae_va = ae_prepare_matrix(va_df, ae_input_cols, global_ae_medians)
-
+            med = tr_df[ae_input_cols].median()
+            X_ae_tr = ae_prepare_matrix(tr_df, ae_input_cols, med)
+            X_ae_va = ae_prepare_matrix(va_df, ae_input_cols, med)
             sc, sd, z_va = ae_train_fold(X_ae_tr, X_ae_va, AE_DEVICE, SEED + fold)
-
             train.loc[train.index[va_idx], AE_COLS] = z_va
             va_df[AE_COLS] = z_va
             ae_fold_artifacts.append((sc, sd))
-
-            print(f"    AE: val embedding {z_va.shape}")
+            print(f" AE: val embedding {z_va.shape}")
 
         X_tr = tr_df[feature_cols_s1]
         X_va = va_df[feature_cols_s1]
         y_tr = y_all[tr_idx]
         sw_tr = sw_all[tr_idx]
 
-        # LGB multi-seed (v20: 4 seeds)
+        # LGB multi-seed
         lgb_preds = []
-
         for rs in LGB_SEEDS:
             lp = {**lgb_params, "random_state": rs}
             m = lgb.LGBMRegressor(**lp)
-
             m.fit(
                 X_tr,
                 y_tr,
@@ -1115,13 +1088,8 @@ def main():
                     lgb.log_evaluation(-1),
                 ],
             )
-
             lgb_preds.append(from_train_pred(m.predict(X_va)))
             models_s1_lgb.append(m)
-
-            # 피처 중요도 누적 (gain 기준)
-            imp = m.booster_.feature_importance(importance_type="gain")
-            lgb_importance_sum += imp
 
         oof_s1_lgb[va_idx] = np.mean(lgb_preds, axis=0)
 
@@ -1160,17 +1128,15 @@ def main():
             verbose=max(1, cat_params["iterations"] // 5),
             use_best_model=True,
         )
-
         oof_s1_cat[va_idx] = from_train_pred(m_cat.predict(X_va))
         models_s1_cat.append(m_cat)
 
         avg3 = (oof_s1_lgb[va_idx] + oof_s1_xgb[va_idx] + oof_s1_cat[va_idx]) / 3
-
         print(
-            f"    Fold {fold} MAE: LGB={mae(y_raw[va_idx], oof_s1_lgb[va_idx]):.4f}"
-            f"  XGB={mae(y_raw[va_idx], oof_s1_xgb[va_idx]):.4f}"
-            f"  CAT={mae(y_raw[va_idx], oof_s1_cat[va_idx]):.4f}"
-            f"  AVG={mae(y_raw[va_idx], avg3):.4f}"
+            f" Fold {fold} MAE: LGB={mae(y_raw[va_idx], oof_s1_lgb[va_idx]):.4f}"
+            f" XGB={mae(y_raw[va_idx], oof_s1_xgb[va_idx]):.4f}"
+            f" CAT={mae(y_raw[va_idx], oof_s1_cat[va_idx]):.4f}"
+            f" AVG={mae(y_raw[va_idx], avg3):.4f}"
         )
 
     # Stage 1 Ensemble
@@ -1179,22 +1145,19 @@ def main():
         "xgb": mae(y_raw, oof_s1_xgb),
         "cat": mae(y_raw, oof_s1_cat),
     }
-
     oof_s1_by = {
         "lgb": oof_s1_lgb,
         "xgb": oof_s1_xgb,
         "cat": oof_s1_cat,
     }
 
-    print(f"\n  S1 OOF: LGB={mae_s1['lgb']:.4f}  XGB={mae_s1['xgb']:.4f}  CAT={mae_s1['cat']:.4f}")
+    print(f"\n S1 OOF: LGB={mae_s1['lgb']:.4f} XGB={mae_s1['xgb']:.4f} CAT={mae_s1['cat']:.4f}")
 
     best_s1_models, best_s1_p, best_s1_mae = None, None, float("inf")
-
     for models in _powerset_models():
         for p in P_GRID:
             pred = ensemble_pred(oof_s1_by, mae_s1, models, p)
             m_val = mae(y_raw, pred)
-
             if m_val < best_s1_mae:
                 best_s1_mae, best_s1_models, best_s1_p = m_val, list(models), p
 
@@ -1202,47 +1165,24 @@ def main():
     ws_s1 = sum(w_s1.values())
     oof_s1 = sum(w_s1[m] * oof_s1_by[m] for m in best_s1_models) / ws_s1
 
-    print(f"  ★ S1 Ensemble: {best_s1_models} p={best_s1_p}  OOF MAE={best_s1_mae:.6f}  ({elapsed(t0)})")
+    print(f" ★ S1 Ensemble: {best_s1_models} p={best_s1_p} OOF MAE={best_s1_mae:.6f} ({elapsed(t0)})")
 
     # AE test embeddings
     if USE_AUTOENCODER and ae_fold_artifacts:
-        # v20: test AE encoding도 global_ae_medians 사용 (train과 일관성)
-        X_te_raw = ae_prepare_matrix(test, ae_input_cols, global_ae_medians)
-
-        z_folds = [
-            ae_encode(sc.transform(X_te_raw), sd, AE_DEVICE)
-            for sc, sd in ae_fold_artifacts
-        ]
-
+        med_te = train[ae_input_cols].median()
+        X_te_raw = ae_prepare_matrix(test, ae_input_cols, med_te)
+        z_folds = [ae_encode(sc.transform(X_te_raw), sd, AE_DEVICE) for sc, sd in ae_fold_artifacts]
         z_mean = np.mean(z_folds, axis=0)
-
         for i, c in enumerate(AE_COLS):
             test[c] = z_mean[:, i]
-
-    # ── v20: Stage 2용 상위 피처 선택 ──
-    # Stage 1 LGB 모델들의 gain 기준 피처 중요도 상위 TOP_FEATURES_FOR_S2개를 선택한다.
-    # Stage 2에서 불필요한 피처를 줄여 과적합을 완화한다.
-    section(f"Stage 2용 피처 선택 (상위 {TOP_FEATURES_FOR_S2}개)")
-
-    n_top = min(TOP_FEATURES_FOR_S2, len(feature_cols_s1))
-    top_indices = np.argsort(lgb_importance_sum)[::-1][:n_top]
-    top_indices_sorted = sorted(top_indices.tolist())
-    top_feature_cols_s1 = [feature_cols_s1[i] for i in top_indices_sorted]
-
-    print(f"  S1 전체 피처: {len(feature_cols_s1)}개 → Stage 2 사용: {len(top_feature_cols_s1)}개")
-    print(f"  상위 10개: {top_feature_cols_s1[:10]}")
 
     # ── 9. Stage 2 ──
     if USE_STAGE2:
         section("Stage 2 — Pred-lag stack")
-
         t0 = time.time()
-
         train = add_pred_lag_features(train, oof_s1, global_mean)
-        # v20: 중요도 상위 피처 + pred_lag 피처
-        feature_cols_s2 = top_feature_cols_s1 + PRED_LAG_COLS
-
-        print(f"  S2 피처: {len(feature_cols_s2)} (top_s1={len(top_feature_cols_s1)}, pred_lag={len(PRED_LAG_COLS)})")
+        feature_cols_s2 = feature_cols_s1 + PRED_LAG_COLS
+        print(f" S2 피처: {len(feature_cols_s2)} (+pred_lag {len(PRED_LAG_COLS)})")
 
         lgb_params_s2 = dict(
             objective="regression_l1",
@@ -1299,7 +1239,7 @@ def main():
         models_s2_lgb, models_s2_xgb, models_s2_cat = [], [], []
 
         for fold, (tr_idx, va_idx) in enumerate(kf.split(train, y_strat, groups=groups), 1):
-            print(f"\n  ── S2 Fold {fold}/{N_FOLDS} ──")
+            print(f"\n ── S2 Fold {fold}/{N_FOLDS} ──")
 
             tr_df = train.iloc[tr_idx]
             va_df = train.iloc[va_idx]
@@ -1326,7 +1266,6 @@ def main():
                     lgb.log_evaluation(-1),
                 ],
             )
-
             oof_s2_lgb[va_idx] = from_train_pred(m_lgb.predict(X_va))
             models_s2_lgb.append(m_lgb)
 
@@ -1363,17 +1302,15 @@ def main():
                 verbose=False,
                 use_best_model=True,
             )
-
             oof_s2_cat[va_idx] = from_train_pred(m_cat.predict(X_va))
             models_s2_cat.append(m_cat)
 
             avg3 = (oof_s2_lgb[va_idx] + oof_s2_xgb[va_idx] + oof_s2_cat[va_idx]) / 3
-
             print(
-                f"    LGB={mae(y_raw[va_idx], oof_s2_lgb[va_idx]):.4f}"
-                f"  XGB={mae(y_raw[va_idx], oof_s2_xgb[va_idx]):.4f}"
-                f"  CAT={mae(y_raw[va_idx], oof_s2_cat[va_idx]):.4f}"
-                f"  AVG={mae(y_raw[va_idx], avg3):.4f}"
+                f" LGB={mae(y_raw[va_idx], oof_s2_lgb[va_idx]):.4f}"
+                f" XGB={mae(y_raw[va_idx], oof_s2_xgb[va_idx]):.4f}"
+                f" CAT={mae(y_raw[va_idx], oof_s2_cat[va_idx]):.4f}"
+                f" AVG={mae(y_raw[va_idx], avg3):.4f}"
             )
 
         mae_s2 = {
@@ -1381,22 +1318,19 @@ def main():
             "xgb": mae(y_raw, oof_s2_xgb),
             "cat": mae(y_raw, oof_s2_cat),
         }
-
         oof_s2_by = {
             "lgb": oof_s2_lgb,
             "xgb": oof_s2_xgb,
             "cat": oof_s2_cat,
         }
 
-        print(f"\n  S2 OOF: LGB={mae_s2['lgb']:.4f}  XGB={mae_s2['xgb']:.4f}  CAT={mae_s2['cat']:.4f}")
+        print(f"\n S2 OOF: LGB={mae_s2['lgb']:.4f} XGB={mae_s2['xgb']:.4f} CAT={mae_s2['cat']:.4f}")
 
         best_s2_models, best_s2_p, best_s2_mae = None, None, float("inf")
-
         for models in _powerset_models():
             for p in P_GRID:
                 pred = ensemble_pred(oof_s2_by, mae_s2, models, p)
                 m_val = mae(y_raw, pred)
-
                 if m_val < best_s2_mae:
                     best_s2_mae, best_s2_models, best_s2_p = m_val, list(models), p
 
@@ -1404,19 +1338,17 @@ def main():
         ws_s2 = sum(w_s2.values())
         oof_s2 = sum(w_s2[m] * oof_s2_by[m] for m in best_s2_models) / ws_s2
 
-        print(f"  ★ S2 Ensemble: {best_s2_models} p={best_s2_p}  OOF MAE={best_s2_mae:.6f}  ({elapsed(t0)})")
-        print(f"\n  S1 → S2 개선: {best_s1_mae - best_s2_mae:.6f}")
+        print(f" ★ S2 Ensemble: {best_s2_models} p={best_s2_p} OOF MAE={best_s2_mae:.6f} ({elapsed(t0)})")
+        print(f"\n S1 → S2 개선: {best_s1_mae - best_s2_mae:.6f}")
 
     # ── 10. Blending + Clipping ──
     section("Blending + Clipping (보수적)")
 
     if USE_STAGE2:
         best_alpha, best_blend_mae = 0.0, mae(y_raw, oof_s2)
-
         for alpha in np.arange(0.0, 1.01, BLEND_ALPHA_STEP):
             blend = alpha * oof_s1 + (1.0 - alpha) * oof_s2
             m_val = mae(y_raw, blend)
-
             if m_val < best_blend_mae:
                 best_blend_mae, best_alpha = m_val, float(alpha)
 
@@ -1446,7 +1378,6 @@ def main():
             for a in alpha_grid_ts:
                 pred_ts = a * oof_s1[idx] + (1.0 - a) * oof_s2[idx]
                 m_ts = np.mean(np.abs(y_raw[idx] - pred_ts))
-
                 if m_ts < best_m:
                     best_m = m_ts
                     best_a = float(a)
@@ -1455,14 +1386,12 @@ def main():
                 (1.0 - TIMESLOT_ALPHA_SMOOTH_TO_GLOBAL) * best_a
                 + TIMESLOT_ALPHA_SMOOTH_TO_GLOBAL * best_alpha
             )
-
             ts_alpha_map[int(ts)] = float(a_smooth)
             ts_oof_blend[idx] = a_smooth * oof_s1[idx] + (1.0 - a_smooth) * oof_s2[idx]
 
         ts_oof_final = np.clip(ts_oof_blend, 0.0, clip_hi)
         ts_mae = mae(y_raw, ts_oof_final)
-
-        print(f"  timeslot_alpha MAE={ts_mae:.6f}")
+        print(f" timeslot_alpha MAE={ts_mae:.6f}")
 
         if ts_mae < final_mae:
             oof_blend = ts_oof_blend
@@ -1475,8 +1404,7 @@ def main():
 
     if ENABLE_GLOBAL_CALIBRATION_SEARCH:
         cand_params, cand_mae, calib_df = search_global_calibration(oof_final, y_raw)
-
-        print(f"  calibration candidate MAE={cand_mae:.6f} params={cand_params}")
+        print(f" calibration candidate MAE={cand_mae:.6f} params={cand_params}")
 
         if cand_mae < final_mae:
             oof_final, _ = apply_scale_bias_clip(
@@ -1485,28 +1413,25 @@ def main():
                 cand_params["bias"],
                 cand_params["clip_q"],
             )
-
             final_mae = cand_mae
             calib_params = cand_params
             USE_CALIBRATION = True
 
-    print(f"  blend alpha={best_alpha:.2f} (S1 weight)")
-    print(f"  clip_q={CLIP_Q} (hi={clip_hi:.2f})")
-    print(f"  FINAL_METHOD={FINAL_METHOD}")
-    print(f"  USE_CALIBRATION={USE_CALIBRATION}  calib_params={calib_params}")
-    print(f"\n  ▶ S1 OOF MAE:  {best_s1_mae:.6f}")
+    print(f" blend alpha={best_alpha:.2f} (S1 weight)")
+    print(f" clip_q={CLIP_Q} (hi={clip_hi:.2f})")
+    print(f" FINAL_METHOD={FINAL_METHOD}")
+    print(f" USE_CALIBRATION={USE_CALIBRATION} calib_params={calib_params}")
+    print(f"\n ▶ S1 OOF MAE: {best_s1_mae:.6f}")
 
     if USE_STAGE2:
-        print(f"  ▶ S2 OOF MAE:  {best_s2_mae:.6f}")
+        print(f" ▶ S2 OOF MAE: {best_s2_mae:.6f}")
 
-    print(f"  ▶ Blend MAE:   {best_blend_mae:.6f}")
-    print(f"  ★★ FINAL OOF MAE: {final_mae:.6f}")
+    print(f" ▶ Blend MAE: {best_blend_mae:.6f}")
+    print(f" ★★ FINAL OOF MAE: {final_mae:.6f}")
 
     # ── 11. Test Prediction ──
     section("Test 예측 + 제출")
-
     test = test.sort_values(["scenario_id", "ID"]).reset_index(drop=True)
-
     X_test_s1 = test[feature_cols_s1]
 
     p_lgb = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_lgb], axis=0)
@@ -1518,11 +1443,23 @@ def main():
         for m in best_s1_models
     ) / ws_s1
 
-    print(f"  S1 test: mean={pred_s1.mean():.2f}  std={pred_s1.std():.2f}")
+    print(f" S1 test: mean={pred_s1.mean():.2f} std={pred_s1.std():.2f}")
+
+    # S1-only 제출 파일 저장
+    pred_s1_only = np.clip(pred_s1, 0.0, clip_hi)
+    pred_s1_df = pd.DataFrame({"ID": test["ID"].values, TARGET: pred_s1_only})
+    sub_s1 = sample_submission.copy()
+    sub_s1[TARGET] = sub_s1["ID"].map(pred_s1_df.set_index("ID")[TARGET])
+
+    if sub_s1[TARGET].isna().any():
+        missing = sub_s1.loc[sub_s1[TARGET].isna(), "ID"].head().tolist()
+        raise ValueError(f"S1-only 제출 매핑 실패: 예측값이 없는 ID가 있습니다. 예: {missing}")
+
+    sub_s1.to_csv("submission_s1_only.csv", index=False)
+    print(" ▶ S1-only 저장: submission_s1_only.csv")
 
     if USE_STAGE2:
         test = add_pred_lag_features(test, pred_s1, global_mean)
-
         X_test_s2 = test[feature_cols_s2]
 
         p2_lgb = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_lgb], axis=0)
@@ -1534,7 +1471,7 @@ def main():
             for m in best_s2_models
         ) / ws_s2
 
-        print(f"  S2 test: mean={pred_s2.mean():.2f}  std={pred_s2.std():.2f}")
+        print(f" S2 test: mean={pred_s2.mean():.2f} std={pred_s2.std():.2f}")
 
         if FINAL_METHOD == "timeslot_alpha" and len(ts_alpha_map) > 0 and "timeslot" in test.columns:
             test_alpha = test["timeslot"].map(ts_alpha_map).fillna(best_alpha).values.astype(float)
@@ -1567,22 +1504,24 @@ def main():
         missing = sub.loc[sub[TARGET].isna(), "ID"].head().tolist()
         raise ValueError(f"sample_submission 매핑 실패: 예측값이 없는 ID가 있습니다. 예: {missing}")
 
-    save_path = project_root / "submission_v20.csv"
+    save_path = project_root / "submission_hybrid_legal_scenario.csv"
     sub.to_csv(save_path, index=False)
 
-    oof_path = project_root / "oof_v20.csv"
+    # OOF diagnostics
+    oof_path = project_root / "oof_hybrid_legal_scenario.csv"
+    pd.DataFrame(
+        {
+            "ID": train["ID"].values,
+            "y_true": y_raw,
+            "oof_pred": oof_final,
+            "abs_error": np.abs(y_raw - oof_final),
+        }
+    ).to_csv(oof_path, index=False)
 
-    pd.DataFrame({
-        "ID": train["ID"].values,
-        "y_true": y_raw,
-        "oof_pred": oof_final,
-        "abs_error": np.abs(y_raw - oof_final),
-    }).to_csv(oof_path, index=False)
-
-    print(f"\n  ▶ 저장: {save_path}")
-    print(f"  ▶ OOF 저장: {oof_path}")
-    print(f"  ▶ 전체 소요: {elapsed(T0)}")
-    print(f"\n  ★★ FINAL OOF MAE: {final_mae:.6f}")
+    print(f"\n ▶ 저장: {save_path}")
+    print(f" ▶ OOF 저장: {oof_path}")
+    print(f" ▶ 전체 소요: {elapsed(T0)}")
+    print(f"\n ★★ FINAL OOF MAE: {final_mae:.6f}")
 
 
 if __name__ == "__main__":
