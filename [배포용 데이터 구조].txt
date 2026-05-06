@@ -1,0 +1,55 @@
+[배포용 데이터 구조]
+
+        open.zip
+
+        ├── train.csv              # 학습 데이터 (250,000행 × 94컬럼)
+
+        ├── test.csv               # 평가 데이터 (50,000행 × 93컬럼)
+
+        ├── layout_info.csv        # 창고 레이아웃 보조 정보 (300행 × 15컬럼)
+
+        └── sample_submission.csv  # 제출 양식 파일 (50,000행 × 2컬럼)
+
+
+
+[세부 설명]
+
+	train.csv: 모델 학습을 위한 데이터셋입니다. 각 행은 특정 시나리오의 특정 시점에서의 창고 운영 상태를 나타냅니다.
+
+	- ID : 샘플 고유 식별 번호
+
+	- layout_id : 창고 레이아웃 ID
+
+	- scenario_id : 시나리오 ID
+
+	- 90개 피처 컬럼 : 해당 시점의 창고 운영 상태
+
+	- avg_delay_minutes_next_30m : 향후 30분간의 평균 출고 지연 시간(분) — 예측 대상(타깃)
+
+
+
+	test.csv: 모델 성능 평가를 위한 평가 데이터셋입니다. train.csv와 동일한 구조이나, 타깃 컬럼이 제외되어 있습니다.
+
+	- ID : 샘플 고유 식별 번호
+
+	- layout_id : 창고 레이아웃 ID
+
+	- scenario_id : 시나리오 ID
+
+	- 90개 피처 컬럼 : train.csv와 동일
+
+
+
+	layout_info.csv: 창고 레이아웃 관련 보조 테이블입니다.
+
+	- layout_id : 창고 레이아웃 ID
+
+	- 14개 레이아웃 관련 컬럼
+
+
+
+	sample_submission.csv: 최종 결과 제출을 위한 양식 파일입니다.
+
+	- ID : 평가 데이터(test) 고유 식별 번호
+
+	- avg_delay_minutes_next_30m : 예측값 (분)

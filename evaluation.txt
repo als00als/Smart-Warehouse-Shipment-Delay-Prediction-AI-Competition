@@ -1,0 +1,18 @@
+1. 리더보드
+평가 산식 : MAE
+
+
+import numpy as np
+
+def MAE(true, pred):
+    score = np.mean(np.abs(true - pred))
+    return score
+
+
+Public Score : 전체 테스트 데이터 중 샘플링된 30%
+Private Score : 전체 테스트 데이터 중 나머지 70%
+
+
+2. 평가
+1차 평가: 리더보드 Private Score 100%
+2차 평가: Private Score 상위 10팀 코드 및 PPT 제출 후 코드 검증

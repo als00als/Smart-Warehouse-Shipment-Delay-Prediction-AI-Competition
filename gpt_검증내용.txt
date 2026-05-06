@@ -1,0 +1,165 @@
+결론: Claude 검증 내용은 큰 방향은 대체로 맞지만, 일부는 “확정 위반”처럼 단정하기 어렵고, 몇 가지는 잘못 해석했다. 특히 encode_remaining_objects와 AE scaler 관련 지적은 정정이 필요하다.
+
+1. Claude 검증 중 “맞는 내용”
+① 4개 txt 파일 요약은 맞다
+
+evaluation.txt는 평가 산식이 MAE이고, Public 30% / Private 70%, 2차 평가는 Private 상위 10팀 코드·PPT 제출 후 검증이라고 되어 있다.
+rules.txt에는 test 데이터를 어떤 형태로도 모델 학습에 활용할 수 없고, Private Score 복원이 가능해야 하며, 상대 경로·UTF-8·오류 없는 실행·개발 환경 및 라이브러리 버전 기재가 필요하다고 되어 있다.
+[배포용 데이터 구조].txt에는 sample_submission.csv가 최종 제출 양식 파일로 포함되어 있다.
+
+② sample_submission.csv를 읽지 않는다는 지적은 맞다
+
+노트북에서는 train.csv, test.csv, layout_info.csv만 읽고, sample_submission.csv는 읽지 않는다. 마지막 제출 파일도 다음처럼 직접 만든다.
+
+sub = pd.DataFrame({"ID": test["ID"], TARGET: pred_final})
+
+Claude의 “sample_submission을 사용하지 않는다”는 지적 자체는 맞다. 다만 이것이 무조건 규칙 위반은 아니다. sample_submission은 보통 제출 양식 참고용이므로, 같은 ID와 컬럼명을 맞추면 직접 DataFrame을 만들어도 되는 경우가 많다.
+
+하지만 이 코드는 제출 직전에
+
+test = test.sort_values(["scenario_id", "ID"]).reset_index(drop=True)
+
+로 test 순서를 바꾼 뒤 제출을 만든다. 따라서 평가 시스템이 ID 기준으로 매칭하지 않고 행 순서 기준으로 평가한다면 위험하다. 이 부분은 Claude의 우려가 타당하다. 단, 평가 시스템이 ID를 기준으로 정렬/매칭한다면 문제 없을 수 있다. 이 부분은 확실하지 않음.
+
+③ Optuna 재현성 문제는 맞다
+
+코드에 다음 로직이 있다.
+
+study = optuna.create_study(direction="minimize")
+
+여기서 sampler=optuna.samplers.TPESampler(seed=SEED) 같은 시드 고정이 없다. 그래서 Optuna 탐색 결과가 실행마다 달라질 수 있다. rules.txt에 “제출한 코드는 Private Score 복원이 가능해야 함”이라고 되어 있으므로, 이건 재현성 리스크가 맞다.
+
+또한 GPU 사용 시 AutoEncoder 쪽에서 torch.backends.cudnn.deterministic = True, torch.backends.cudnn.benchmark = False 같은 결정론 설정이 없다. Claude의 이 지적도 타당하다.
+
+④ preprocess_all의 독립 factorize 문제는 맞다
+
+코드 흐름은 다음과 같다.
+
+train = preprocess_all(train, layout)
+test = preprocess_all(test, layout)
+train, test = encode_remaining_objects(train, test, exclude=("ID",))
+
+그런데 preprocess_all() 내부에서 object 컬럼을 각각 따로 pd.factorize() 한다.
+
+df[_c] = pd.factorize(df[_c].astype(str).fillna("missing"))[0].astype(np.int32)
+
+즉, train과 test에서 같은 문자열 값이 서로 다른 숫자로 바뀔 수 있다. 예를 들어 train에서는 "A" → 0, test에서는 "A" → 2가 될 수 있다. 이건 모델 입력 의미를 망가뜨릴 수 있는 실제 코드 문제다.
+
+⑤ 시나리오 전체 집계로 인한 Look-ahead Leakage 지적은 대체로 맞다
+
+코드에는 다음 로직이 있다.
+
+stats = df.groupby("scenario_id")[present].agg(["mean", "max", "min", "std"])
+df = df.merge(stats, on="scenario_id", how="left")
+
+이렇게 하면 같은 scenario_id의 전체 타임슬롯 값을 한 행의 feature로 붙인다. 대회 설명은 “현재 시점으로부터 향후 30분간의 평균 출고 지연 시간”을 예측하는 문제라고 설명하고 있다.
+따라서 현재 시점 행이 같은 시나리오의 미래 타임슬롯 정보를 사용한다면, 시간 순서 기준으로는 look-ahead leakage로 보는 게 맞다.
+
+다만 공식 규칙에 “같은 test 파일 안의 다른 시간 행을 feature engineering에 쓰면 안 된다”라고 명시된 문장은 내가 확인한 txt 안에는 없다. 그래서 규칙 위반 확정이라기보다는, 문제 정의상 매우 위험한 누수 로직이라고 보는 게 정확하다.
+
+⑥ Optuna가 3-fold를 만들고 실제로는 1개 fold만 쓰는 지적은 맞다
+
+코드에서
+
+sample_folds = list(sample_kf.split(...))
+tr_idx, val_idx = sample_folds[0]
+
+처럼 항상 첫 번째 fold만 사용한다. 따라서 “3-fold CV를 만든 것처럼 보이지만 HPO는 fold 0 하나만 사용한다”는 Claude 지적은 맞다.
+이건 규칙 위반은 아니지만, 특정 split에 과적합된 hyperparameter를 고를 위험이 있다.
+
+⑦ OOF 전체 기준 alpha/calibration 최적화는 “누수”라기보다 과적합 위험이라는 판단이 맞다
+
+Claude가 말한 것처럼, 앙상블 가중치, best_alpha, timeslot별 alpha, calibration을 모두 같은 OOF 예측값과 train target으로 반복 최적화한다.
+OOF라서 직접적인 train target leakage라고 단정하긴 어렵지만, 단일 OOF 세트에 후처리를 많이 맞추면 OOF MAE에 과적합될 수 있다. 이 지적은 맞다.
+
+2. Claude 검증 중 “틀리거나 과장된 내용”
+① encode_remaining_objects가 실제로 train/test 결합 인코딩을 수행한다고 단정한 부분은 부정확하다
+
+Claude는 encode_remaining_objects가 train/test를 합쳐 factorize하므로 test 데이터가 학습에 활용된다고 했다. 함수 자체만 보면 맞다.
+
+combined = pd.concat([train_df[c], test_df[c]], axis=0).astype(str).fillna("missing")
+codes, _ = pd.factorize(combined)
+
+하지만 실행 흐름상 바로 직전에 preprocess_all(train)과 preprocess_all(test)가 각각 모든 object 컬럼을 숫자로 바꾼다. 그러면 encode_remaining_objects()는 숫자형 컬럼을 건너뛰기 때문에 실제로는 no-op일 가능성이 높다.
+
+정리하면:
+
+함수 자체는 train/test 결합 인코딩 로직이 맞다.
+하지만 현재 코드 흐름에서는 이미 object가 숫자화되어 실제로 실행되지 않을 가능성이 높다.
+따라서 Claude가 이것을 실제 규칙 위반처럼 단정한 건 과장이다.
+정확한 판단: “위반 소지가 있는 함수는 존재하지만, 이 코드 흐름에서 실제로 적용되는지는 데이터 dtype을 봐야 확정 가능”이다.
+② AE test 인코딩에서 fold별 scaler를 쓰는 것을 “재현성 문제”라고 한 건 부정확하다
+
+Claude는 다음 로직을 문제 삼았다.
+
+z_folds = [ae_encode(sc.transform(X_te_raw), sd, AE_DEVICE) for sc, sd in ae_fold_artifacts]
+z_mean = np.mean(z_folds, axis=0)
+
+각 fold에서 학습된 AE scaler/model로 test embedding을 만들고 평균내는 구조다. 이건 앙상블 방식으로 볼 수 있다.
+이 자체는 데이터 누수도 아니고 재현성 문제도 아니다.
+
+다만 더 정확한 문제는 따로 있다. train fold에서는 각 fold의 train 데이터 median으로 AE 입력을 만들었는데, test에서는
+
+med_te = train[ae_input_cols].median()
+
+처럼 전체 train median을 사용한다. 즉, fold별 AE 학습 때 사용한 결측치 대체 기준과 test 결측치 대체 기준이 다르다.
+그래서 이 부분은 “재현성 문제”가 아니라 전처리 일관성 문제라고 보는 게 맞다.
+
+③ “제출 경로가 상대 경로 요건을 충족한다”는 Claude 판단은 확실하지 않다
+
+Claude는 저장 경로가 data 폴더의 부모라서 상대 경로 요건은 충족한다고 했다. 그런데 실제 코드는 _resolve_data_dir()에서 Path.cwd().resolve() 또는 Path(__file__).resolve()를 사용하고, 최종적으로 project_root = str(Path(data_dir).resolve().parent)를 만든다.
+
+즉, 코드에 하드코딩된 절대경로는 없지만, 실행 중에는 절대경로로 변환된다. rules.txt는 “코드에 데이터 입/출력 경로를 상대 경로로 표기”하라고 되어 있다.
+따라서 Claude처럼 “충족”이라고 단정하기보다는 “하드코딩 절대경로는 아니지만, 엄격히 보면 상대경로 표기 요건은 애매함”이 더 정확하다.
+
+3. Claude가 놓친 추가 문제
+① Optuna 미설치 시 fallback 코드가 사실상 작동하지 않을 수 있다
+
+코드 초반에 다음이 있다.
+
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except Exception:
+    optuna = None
+    OPTUNA_AVAILABLE = False
+
+...
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+optuna가 설치되어 있지 않으면 optuna = None이 되는데, 바로 아래에서 optuna.logging...을 호출한다. 그러면 AttributeError가 발생할 수 있다.
+
+즉, 뒤쪽에
+
+if USE_OPTUNA_HPO and not OPTUNA_AVAILABLE:
+    print("Optuna가 설치되어 있지 않아 기본 LGB 파라미터를 사용합니다.")
+
+라는 fallback 로직이 있어도, 그 전에 코드가 죽을 수 있다.
+이건 Claude가 놓친 실제 실행 안정성 문제다. rules.txt에는 “모든 코드는 오류 없이 실행되어야 함”이 있으므로 중요하다.
+
+② 개발 환경 및 라이브러리 버전 기재가 없다
+
+rules.txt에는 “개발 환경(OS) 및 라이브러리 버전 기재”가 필요하다고 되어 있다.
+내가 확인한 노트북 코드에는 python, pandas, lightgbm, xgboost, catboost, torch, optuna 등의 버전을 출력하거나 기록하는 부분이 없다.
+
+이건 Claude가 언급하지 않은 제출 규칙 누락이다.
+
+③ handle_missing()도 시간 누수 가능성이 있다
+
+코드에는 결측치 처리에서 다음 흐름이 있다.
+
+df[cols] = df.groupby("scenario_id")[cols].ffill()
+df[cols] = df.groupby("scenario_id")[cols].bfill()
+
+bfill()은 뒤 시점 값을 앞 시점 결측치에 채운다. 만약 시계열 관점에서 현재 시점 예측만 가능해야 한다면, 미래 시점 정보를 현재 행에 넣는 문제가 된다.
+
+다만 실제 데이터에 결측치가 있는지까지는 업로드된 파일만으로 확인하지 못했다. 그래서 이건 확실한 누수 발생이 아니라 결측치가 있을 경우 발생 가능한 시간 누수 로직이다.
+
+④ rank(pct=True)도 전체 시나리오 정보를 사용한다
+
+add_interaction_features() 안에는 다음이 있다.
+
+df[f"{col}_scen_rank"] = df.groupby("scenario_id")[col].rank(pct=True)
+
+이것도 같은 시나리오의 전체 타임슬롯 분포를 알아야 계산된다. 따라서 앞 시점 행이 뒤 시점 값들과 비교된 percentile rank를 갖게 된다. Claude가 말한 scenario mean/max/min/std와 같은 계열의 look-ahead risk다.
