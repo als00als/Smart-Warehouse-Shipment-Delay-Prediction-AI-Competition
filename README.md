@@ -37,7 +37,7 @@ python SmartWareHouse_v18.py
 | 항목 | 버전 |
 |---|---|
 | OS | Windows 11 Home |
-| Python | 3.10.x |
+| Python | 3.14.0 |
 | LightGBM | 4.3.0 |
 | XGBoost | 2.0.3 |
 | CatBoost | 1.2.5 |
