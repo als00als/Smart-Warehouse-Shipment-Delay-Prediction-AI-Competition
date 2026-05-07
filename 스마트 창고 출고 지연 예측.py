@@ -7,7 +7,7 @@
 #
 # 개발 환경
 #   OS      : Windows 11 Home
-#   Python  : 3.10.x
+#   Python  : 3.14.0
 #   lightgbm: 4.3.0
 #   xgboost : 2.0.3
 #   catboost: 1.2.5
@@ -18,7 +18,6 @@
 #   pandas  : 2.2.2
 # ============================================================
 
-import os
 import time
 import warnings
 from pathlib import Path
@@ -28,12 +27,7 @@ import pandas as pd
 import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
-try:
-    import optuna
-    OPTUNA_AVAILABLE = True
-except Exception:
-    optuna = None
-    OPTUNA_AVAILABLE = False
+import optuna
 
 from sklearn.model_selection import StratifiedGroupKFold, GroupKFold
 from sklearn.metrics import mean_absolute_error
@@ -43,8 +37,7 @@ import torch
 import torch.nn as nn
 
 warnings.filterwarnings("ignore")
-if OPTUNA_AVAILABLE:
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -142,21 +135,31 @@ def mae(y_true, y_pred):
     return mean_absolute_error(y_true, y_pred)
 
 
-def _resolve_data_dir() -> str:
-    try:
-        here = Path(__file__).resolve().parent
-    except NameError:
-        here = Path.cwd().resolve()
-    # 스크립트와 같은 폴더에 train.csv가 바로 있으면 그 폴더 반환
-    if (here / "train.csv").is_file():
-        return str(here)
-    # data/ 서브폴더 탐색
-    for p in [here, *here.parents]:
-        d = p / "data"
-        if d.is_dir() and (d / "train.csv").is_file():
-            return str(d)
-    raise FileNotFoundError("train.csv not found — 스크립트와 같은 폴더 또는 data/ 서브폴더에 데이터를 넣어주세요")
+def _resolve_data_dir() -> Path:
+    """
+    대회 제출용 데이터 경로 탐색.
+    모든 입출력 경로는 상대 경로만 사용한다.
 
+    우선순위:
+    1. ./data/train.csv
+    2. ./train.csv
+    """
+    candidates = [
+        Path("./data"),
+        Path("."),
+    ]
+
+    for data_dir in candidates:
+        if (
+            (data_dir / "train.csv").is_file()
+            and (data_dir / "test.csv").is_file()
+            and (data_dir / "layout_info.csv").is_file()
+        ):
+            return data_dir
+
+    raise FileNotFoundError(
+        "train.csv, test.csv, layout_info.csv를 ./data 폴더 또는 현재 폴더에 넣어주세요."
+    )
 
 def _powerset_models():
     return [
@@ -611,13 +614,12 @@ def main():
     # ── 1. Data Load ──
     section("데이터 로드")
     data_dir = _resolve_data_dir()
-    project_root = str(Path(data_dir).resolve().parent)
     print(f"  data: {data_dir}")
     t0 = time.time()
-    train = pd.read_csv(os.path.join(data_dir, "train.csv"))
-    test = pd.read_csv(os.path.join(data_dir, "test.csv"))
-    layout = pd.read_csv(os.path.join(data_dir, "layout_info.csv"))
-    print(f"  train {len(train):,} / test {len(test):,}  ({elapsed(t0)})")
+
+    train = pd.read_csv(data_dir / "train.csv")
+    test = pd.read_csv(data_dir / "test.csv")
+    layout = pd.read_csv(data_dir / "layout_info.csv")
 
     # ── 2. Preprocessing ──
     section("전처리")
@@ -679,7 +681,7 @@ def main():
         print(f"  CV: GroupKFold ({N_FOLDS}-fold)")
 
     # ── 6. Optuna HPO ──
-    if USE_OPTUNA_HPO and OPTUNA_AVAILABLE:
+    if USE_OPTUNA_HPO :
         section(f"Optuna LightGBM 최적화 ({OPTUNA_TRIALS} trials)")
         rng = np.random.default_rng(SEED)
         sample_scens = train["scenario_id"].unique()
@@ -730,12 +732,15 @@ def main():
         print(f"\n  최적 파라미터: {best_hp}")
         print(f"  Optuna 소요: {elapsed(optuna_start)}")
     else:
-        if USE_OPTUNA_HPO and not OPTUNA_AVAILABLE:
-            print("  Optuna가 설치되어 있지 않아 기본 LGB 파라미터를 사용합니다.")
         best_hp = dict(
-            learning_rate=0.01, max_depth=-1, num_leaves=2047,
-            min_child_samples=60, subsample=0.75,
-            colsample_bytree=0.5, reg_alpha=0.3, reg_lambda=5.0,
+            learning_rate=0.01,
+            max_depth=10,
+            num_leaves=2047,
+            min_child_samples=60,
+            subsample=0.75,
+            colsample_bytree=0.5,
+            reg_alpha=0.3,
+            reg_lambda=5.0,
         )
 
     # ── 7. Stage 1 Model Parameters ──
@@ -1056,7 +1061,7 @@ def main():
     section("Test 예측 + 제출")
     test = test.sort_values(["scenario_id", "ID"]).reset_index(drop=True)
 
-    X_test_s1 = test[feature_cols_s1]
+    X_test_s1 = test[feature_cols_s1].replace([np.inf, -np.inf], np.nan)
     p_lgb = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_lgb], axis=0)
     p_xgb = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_xgb], axis=0)
     p_cat = np.mean([from_train_pred(m.predict(X_test_s1)) for m in models_s1_cat], axis=0)
@@ -1065,7 +1070,7 @@ def main():
 
     if USE_STAGE2:
         test = add_pred_lag_features(test, pred_s1, global_mean)
-        X_test_s2 = test[feature_cols_s2]
+        X_test_s2 = test[feature_cols_s2].replace([np.inf, -np.inf], np.nan)
         p2_lgb = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_lgb], axis=0)
         p2_xgb = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_xgb], axis=0)
         p2_cat = np.mean([from_train_pred(m.predict(X_test_s2)) for m in models_s2_cat], axis=0)
@@ -1089,11 +1094,12 @@ def main():
         )
 
     sub = pd.DataFrame({"ID": test["ID"], TARGET: pred_final})
-    save_path = os.path.join(project_root, "submission_v17_hybrid_best_combo.csv")
+
+    save_path = Path("./submission_v17_hybrid_best_combo.csv")
     sub.to_csv(save_path, index=False)
 
     # OOF diagnostics
-    oof_path = os.path.join(project_root, "oof_v17_hybrid_best_combo.csv")
+    oof_path = Path("./oof_v17_hybrid_best_combo.csv")
     pd.DataFrame({
         "ID": train["ID"].values,
         "y_true": y_raw,
