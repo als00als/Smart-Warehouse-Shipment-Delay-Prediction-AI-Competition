@@ -9,7 +9,7 @@
 | | 점수 |
 |---|---|
 | OOF MAE | 8.458114 |
-| Public Score | 9.7236 |
+| Public Score | 9.71506 |
 | Private Score | 9.9564 |
 
 ---
